@@ -1,0 +1,98 @@
+[build-system]
+requires = ["hatchling==1.32.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agent-enrollment-protocol"
+version = "0.1.0"
+description = "Official Python SDK for the Agent Enrollment Protocol"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "Nas Kavian", email = "nas@inflowpay.ai" },
+]
+keywords = ["aep", "agent", "authentication", "enrollment", "protocol"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+dependencies = [
+  "cryptography>=50.0.1,<51",
+  "httpx>=0.28.1,<1",
+  "pydantic>=2.13.4,<3",
+  "PyJWT>=2.13.0,<3",
+]
+
+[project.urls]
+Documentation = "https://www.aep.foundation/"
+Issues = "https://github.com/aep-foundation/aep-python/issues"
+Repository = "https://github.com/aep-foundation/aep-python"
+
+[dependency-groups]
+dev = [
+  "build==1.5.0",
+  "mypy==2.3.1",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "pytest-cov==7.1.0",
+  "ruff==0.16.4",
+  "twine==7.0.0",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/LICENSE",
+  "/README.md",
+  "/src",
+]
+exclude = ["/.gitignore"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_enrollment_protocol"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+
+[tool.pytest.ini_options]
+addopts = [
+  "--cov=agent_enrollment_protocol",
+  "--cov-branch",
+  "--cov-fail-under=100",
+  "--cov-report=term-missing",
+  "--cov-report=xml",
+  "--strict-config",
+  "--strict-markers",
+]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["agent_enrollment_protocol"]
+
+[tool.coverage.report]
+exclude_also = [
+  "if TYPE_CHECKING:",
+]
+show_missing = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["agent_enrollment_protocol"]
