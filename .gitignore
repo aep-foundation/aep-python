@@ -1,0 +1,12 @@
+/.conformance/
+/.mypy_cache/
+/.pytest_cache/
+/.ruff_cache/
+/.venv/
+/dist/
+/htmlcov/
+/src/*.egg-info/
+/.coverage
+/coverage.xml
+__pycache__/
+*.py[cod]

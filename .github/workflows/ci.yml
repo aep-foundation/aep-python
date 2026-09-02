@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python:
+          - "3.11"
+          - "3.14"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.11.8"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --all-groups --locked --python "${{ matrix.python }}"
+
+      - run: make verify
+
+      - name: Upload coverage to Codecov
+        if: matrix.python == '3.11'
+        uses: codecov/codecov-action@v7
+        with:
+          files: coverage.xml
+          fail_ci_if_error: true
+          flags: unit
+          name: python-3.11-unit
+          use_oidc: true
+
+      - name: Upload coverage report
+        if: matrix.python == '3.11'
+        uses: actions/upload-artifact@v7
+        with:
+          name: aep-python-coverage
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 7
