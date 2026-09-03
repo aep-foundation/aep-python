@@ -32,6 +32,44 @@ protocols.
 
 Framework integrations are optional and remain separate from Core and role behavior.
 
+## Service ASGI integration
+
+`agent_enrollment_protocol.adapters` provides a framework-neutral ASGI integration with no
+additional dependency. `AepAsgiApplication` serves Inspect and every command advertised by the
+Service. It enforces the command methods, media type, request-body limit, and idempotency header
+boundary, and supplies cache metadata and conditional requests for Inspect.
+
+`AepAuthenticationMiddleware` protects a downstream ASGI application and exposes the authenticated
+Agent principal through `principal_from_scope()`. Place the protocol application outside the
+authentication middleware so AEP's own command routes remain directly accessible:
+
+```python
+from agent_enrollment_protocol.adapters import (
+    AepAsgiApplication,
+    AepAuthenticationMiddleware,
+    principal_from_scope,
+)
+
+protected_application = AepAuthenticationMiddleware(
+    application,
+    service,
+    resource_origin="https://service.example",
+)
+asgi_application = AepAsgiApplication(service, protected_application)
+```
+
+The downstream application can obtain its immutable principal from the ASGI scope:
+
+```python
+principal = principal_from_scope(scope)
+if principal is None:
+    raise RuntimeError("The route requires AEP authentication")
+```
+
+Use a separate unprotected application branch for public resources. For local development,
+`allow_insecure_loopback=True` permits an HTTP `localhost` or loopback resource origin; production
+origins require HTTPS.
+
 ## Hosted identity Platform
 
 `agent_enrollment_protocol.platform` implements discovery, Service-scoped Agent identity
