@@ -54,6 +54,7 @@ from .types import (
     IdempotentOperation,
     IdentityListQuery,
     IdentityRecord,
+    KeyStore,
     PlatformIdempotencyInput,
     PlatformIdempotencyState,
     PlatformOptions,
@@ -132,6 +133,8 @@ class Platform:
         if identity is None or identity.status is not ManagedAgentStatus.ACTIVE:
             return _problem(404, "not_recognized", "Identity not recognized")
         validate_identity_record(identity)
+        if identity.agent_did_id != agent_did_id:
+            raise ValueError("AEP Platform identity store returned a mismatched record")
         method = await self._key_store.did_verification_method(identity)
         return PlatformResult(
             status=200,
@@ -173,12 +176,13 @@ class Platform:
             return _problem(404, "not_recognized", "Identity not recognized")
         listed = await self._identity_store.list(context.principal, effective)
         if any(
-            identity.principal != context.principal
-            or (effective.service_did is not None and identity.service_did != effective.service_did)
-            or (effective.status is not None and identity.status is not effective.status)
+            not _valid_listed_identity(identity, context.principal, effective)
             for identity in listed.identities
         ):
             raise ValueError("AEP Platform identity store returned an unauthorized record")
+        identifiers = [identity.agent_identity_id for identity in listed.identities]
+        if listed.total < len(identifiers) or len(set(identifiers)) != len(identifiers):
+            raise ValueError("AEP Platform identity store returned an invalid list result")
         return _success(200, list_response(listed))
 
     async def provision(
@@ -258,7 +262,7 @@ class Platform:
                 SignHandlerInput(identity, _clone_model(request)), context
             )
             if handled is not None:
-                _validate_sign_result(handled, identity, request, lifetime)
+                await _validate_sign_result(handled, identity, request, lifetime, self._key_store)
                 return handled
         now = _aware(self._request_time(context))
         claim_data: dict[str, Any] = {
@@ -286,6 +290,9 @@ class Platform:
         if request.platform_context is not None:
             response_data["platform_context"] = request.platform_context
         body = PlatformSignCompleted.model_validate(response_data)
+        await _validate_sign_result(
+            _success(200, body), identity, request, lifetime, self._key_store
+        )
         return _success(200, body)
 
     async def update_identity(
@@ -311,6 +318,9 @@ class Platform:
         )
         if updated is None:
             return _problem(404, "not_recognized", "Identity not recognized")
+        validate_identity_record(updated)
+        if not _is_lifecycle_update(identity, updated, request.status):
+            raise ValueError("AEP Platform identity store returned a mismatched record")
         return _success(200, identity_response(updated))
 
     async def verify(
@@ -347,6 +357,10 @@ class Platform:
         ):
             return unrecognized
         identity = await self._identity_store.find_by_agent_did(agent_did)
+        if identity is not None:
+            validate_identity_record(identity)
+            if identity.agent_did != agent_did:
+                raise ValueError("AEP Platform identity store returned a mismatched record")
         if (
             identity is None
             or identity.service_did != request.service_did
@@ -443,6 +457,8 @@ class Platform:
         if identity is None:
             return None
         validate_identity_record(identity)
+        if identity.agent_identity_id != agent_identity_id:
+            raise ValueError("AEP Platform identity store returned a mismatched record")
         request = replace(request, identity=identity)
         if (
             not context.principal
@@ -553,11 +569,12 @@ def _problem(status: int, code: str, title: str) -> PlatformResult[BodyT]:
     )
 
 
-def _validate_sign_result(
+async def _validate_sign_result(
     result: PlatformResult[PlatformSignResponse],
     identity: IdentityRecord,
     request: PlatformSignRequest,
     requested_lifetime: int,
+    key_store: KeyStore,
 ) -> None:
     body = result.body
     if isinstance(body, PlatformSignPending):
@@ -575,6 +592,50 @@ def _validate_sign_result(
         or expires - issued != timedelta(seconds=requested_lifetime)
     ):
         raise ValueError("AEP Platform signing handler response does not match the request")
+    try:
+        header, _ = decode_jwt_unverified(body.client_assertion)
+        claims = verify_client_assertion(
+            body.client_assertion,
+            key=await key_store.verification_key(identity),
+            options=VerifyClientAssertionOptions(
+                algorithms=identity.signing_algorithms,
+                audience=request.service_did,
+                current_time=int(issued.timestamp()),
+                issuer=identity.agent_did,
+                operation=request.op,
+                resource=request.resource,
+                subject=identity.agent_did,
+            ),
+        )
+    except AepAssertionError as error:
+        raise ValueError("AEP Platform signer returned an invalid client assertion") from error
+    if (
+        header.get("kid") != identity.key_id
+        or claims.iat != int(issued.timestamp())
+        or claims.exp != int(expires.timestamp())
+        or claims.jti != request.jti
+    ):
+        raise ValueError("AEP Platform signer returned mismatched assertion claims")
+
+
+def _valid_listed_identity(
+    identity: IdentityRecord, principal: str, query: IdentityListQuery
+) -> bool:
+    try:
+        validate_identity_record(identity)
+    except ValueError:
+        return False
+    return (
+        identity.principal == principal
+        and (query.service_did is None or identity.service_did == query.service_did)
+        and (query.status is None or identity.status is query.status)
+    )
+
+
+def _is_lifecycle_update(
+    before: IdentityRecord, after: IdentityRecord, status: ManagedAgentStatus
+) -> bool:
+    return after == replace(before, status=status, updated_at=after.updated_at)
 
 
 def _seconds(value: timedelta, name: str) -> int:
