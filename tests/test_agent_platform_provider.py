@@ -730,6 +730,8 @@ def test_cache_and_pending_value_boundaries() -> None:
     assert not _cache_fresh(entry, NOW + timedelta(seconds=300))
     for control in ("no-cache", "no-store", "max-age=invalid", "max-age=-1"):
         assert not _cache_fresh(replace(entry, cache_control=control), NOW)
+    assert _cache_fresh(replace(entry, cache_control="max-age=999999999999999999999"), NOW)
+    assert not _cache_fresh(replace(entry, cached_at=NOW + timedelta(seconds=1)), NOW)
     assert _cache_directive('public, max-age="60"', "max-age") == '"60"'
     assert _cache_directive("public", "missing") is None
     with pytest.raises(ValueError, match="timestamp"):

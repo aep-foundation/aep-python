@@ -1,7 +1,14 @@
 {
   "claims": [
     {
-      "profiles": ["core-http", "claims", "api-key", "basic", "oauth-bearer"],
+      "profiles": [
+        "core-http",
+        "claims",
+        "api-key",
+        "basic",
+        "oauth-bearer",
+        "platform-hosted-identity"
+      ],
       "role": "agent"
     },
     {
