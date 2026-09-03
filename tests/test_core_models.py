@@ -286,6 +286,8 @@ def test_claim_models_accept_registered_and_additive_values() -> None:
         {"contact.email": "owner.example.com"},
         {"contact.mobile": "(415) 555-0100"},
         {"person.birthdate": "2025-02-30"},
+        {"person.birthdate": "20250101"},
+        {"person.birthdate": "2025-W01-1"},
         {"person.first_name": ""},
     ],
 )
@@ -416,6 +418,30 @@ def test_assertion_problem_credential_and_metadata_models() -> None:
             username="user",
         ).realm
         == "example"
+    )
+    assert "access-secret-value" not in repr(
+        OAuthBearerGrantResponse(
+            access_token="access-secret-value",
+            credential_id="credential-1",
+            expires_at=expires,
+            token_type="Bearer",
+        )
+    )
+    assert "api-secret-value" not in repr(
+        ApiKeyGrantResponse(
+            api_key="api-secret-value",
+            credential_id="credential-2",
+            expires_at=expires,
+            header="X-API-Key",
+        )
+    )
+    assert "basic-secret-value" not in repr(
+        BasicGrantResponse(
+            credential_id="credential-3",
+            expires_at=expires,
+            password="basic-secret-value",
+            username="user",
+        )
     )
     assert IdempotencyMetadata(
         idempotency_key="request-1",

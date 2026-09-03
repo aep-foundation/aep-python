@@ -16,6 +16,7 @@ from agent_enrollment_protocol.core import (
     AEP_MEDIA_TYPE,
     AEP_PROBLEM_MEDIA_TYPE,
     AEP_WELL_KNOWN_PATH,
+    AepAssertionError,
     AepValidationError,
     AgentStatus,
     ApiKeyGrantResponse,
@@ -38,6 +39,7 @@ from agent_enrollment_protocol.core import (
     SigningAlgorithm,
     StatusResponse,
     command_path_from_inspect,
+    decode_jwt_unverified,
     did_web_document_url,
     media_type_essence,
     missing_required_claim_names,
@@ -113,7 +115,8 @@ class Agent:
             raise ValueError("AEP Agent request timeout must be positive and finite")
         self._allow_insecure_loopback = options.allow_insecure_loopback
         self._assertion_lifetime = int(lifetime)
-        self._clock = options.clock
+        self._clock = _validated_clock(options.clock)
+        self._clock()
         owned_transports: list[AsyncHttpTransport] = []
         command_transport: AsyncHttpTransport
         if options.command_transport is None:
@@ -124,7 +127,7 @@ class Agent:
         else:
             command_transport = options.command_transport
         self._command_transport = command_transport
-        self._credential_store = options.credential_store or MemoryCredentialStore(options.clock)
+        self._credential_store = options.credential_store or MemoryCredentialStore(self._clock)
         self._identity_provider = options.identity_provider
         self._identity_store = options.identity_store or MemoryIdentityStore()
         self._idempotency_keys = options.idempotency_keys or RandomIdempotencyKeyProvider()
@@ -379,7 +382,8 @@ class ServiceSession:
         key = await self._idempotency_key(
             inspection, Command.GRANT.value, options.idempotency_key, grant_type=grant_type
         )
-        request_data: dict[str, object] = {"grant_type": grant_type}
+        request_data: dict[str, object] = dict(options.parameters)
+        request_data["grant_type"] = grant_type
         if options.requested_scopes:
             request_data["requested_scopes"] = options.requested_scopes
         request = GrantRequest.model_validate(request_data)
@@ -395,6 +399,16 @@ class ServiceSession:
         )
         raw = result.body
         credential = _parse_credential(grant_type, raw)
+        if isinstance(credential, ApiKeyGrantResponse):
+            config = (inspection.document.commands.grant_types_config or {}).get(grant_type)
+            configured_headers = None if config is None else config.to_wire().get("header_names")
+            if configured_headers is not None:
+                if not isinstance(configured_headers, list) or any(
+                    not isinstance(value, str) for value in configured_headers
+                ):
+                    raise ValueError("AEP API-key header_names configuration is invalid")
+                if credential.header.lower() not in {value.lower() for value in configured_headers}:
+                    raise ValueError("AEP API-key Grant response header was not advertised")
         grant_result = GrantResult(credential=credential, grant_type=grant_type, raw=raw)
         if credential is not None:
             record = CredentialRecord(
@@ -411,9 +425,10 @@ class ServiceSession:
 
     async def revoke(self, options: RevokeOptions) -> CommandResult[RevokeResponse]:
         if options.all_grant_types:
-            request_data: dict[str, object] = {"all_grant_types": "true"}
+            request_data: dict[str, object] = dict(options.parameters)
+            request_data["all_grant_types"] = "true"
         else:
-            request_data = {}
+            request_data = dict(options.parameters)
             if options.grant_type is not None:
                 request_data["grant_type"] = options.grant_type
             if options.credential_id is not None:
@@ -457,7 +472,7 @@ class ServiceSession:
             )
             if matches:
                 await self._agent._credential_store.delete_credential(
-                    record.service_did, record.credential_id
+                    inspection.document.service.did, record.credential_id
                 )
         return result
 
@@ -656,6 +671,9 @@ class ServiceSession:
         assertion = await signer(claims, tuple(SigningAlgorithm(value) for value in algorithms))
         if not assertion:
             raise ValueError("AEP assertion signer returned an empty assertion")
+        _validate_signed_assertion(
+            assertion, claims, algorithms, self._agent._allow_insecure_loopback
+        )
         return assertion
 
     async def _find_credential(
@@ -827,6 +845,43 @@ def _validate_credential_record(record: CredentialRecord, service_did: str, now:
         or datetime.fromisoformat(credential.expires_at.replace("Z", "+00:00")) != record.expires_at
     ):
         raise ValueError("stored AEP credential metadata does not match its payload")
+
+
+def _validated_clock(clock: Clock) -> Clock:
+    def current_time() -> datetime:
+        value = clock()
+        if value.utcoffset() is None:
+            raise ValueError("AEP Agent clock must return a time with a UTC offset")
+        return value
+
+    return current_time
+
+
+def _validate_signed_assertion(
+    assertion: str,
+    claims: ClientAssertionClaims,
+    algorithms: tuple[str, ...],
+    allow_insecure_loopback: bool,
+) -> None:
+    try:
+        header, payload = decode_jwt_unverified(assertion)
+        parsed_claims = ClientAssertionClaims.model_validate_json(
+            json.dumps(payload),
+            context={"allow_insecure_loopback": allow_insecure_loopback},
+        )
+    except (AepAssertionError, ValueError) as error:
+        raise ValueError("AEP assertion signer returned an invalid assertion") from error
+    key_id = header.get("kid")
+    if (
+        header.get("typ") != "JWT"
+        or header.get("alg") not in algorithms
+        or not isinstance(key_id, str)
+        or key_id.partition("#")[0] != claims.iss
+        or parsed_claims != claims
+    ):
+        raise ValueError(
+            "AEP assertion signer returned an assertion that does not match the request"
+        )
 
 
 def _inspection_from_cache(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -81,9 +82,24 @@ class FakeIdentityProvider:
             assert identity.agent_did == claims.iss
             assert algorithms == (SigningAlgorithm.EDDSA,)
             self.claims.append(claims)
-            return "signed.assertion.value"
+            return signed_assertion(claims)
 
         return sign
+
+
+def signed_assertion(
+    claims: ClientAssertionClaims,
+    *,
+    algorithm: str = "EdDSA",
+    key_id: str | None = None,
+    payload: dict[str, object] | None = None,
+) -> str:
+    def encode(value: object) -> str:
+        data = json.dumps(value, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+    header = {"alg": algorithm, "kid": key_id or claims.iss, "typ": "JWT"}
+    return f"{encode(header)}.{encode(claims.to_wire() if payload is None else payload)}.c2ln"
 
 
 class FixedKeys:
@@ -274,7 +290,7 @@ async def test_authentication_uses_assertion_and_honors_selection() -> None:
             client_assertion_only=True,
         )
     )
-    assert headers == {"AEP-Authorization": "AEP signed.assertion.value"}
+    assert headers["AEP-Authorization"].startswith("AEP ")
     assert provider.claims[-1].resource == "https://api.example.com/resource"
     with pytest.raises(ValueError, match="cannot accompany"):
         await service.authentication_headers(

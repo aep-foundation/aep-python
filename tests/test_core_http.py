@@ -41,6 +41,14 @@ from .test_core_models import inspect_document
 
 def test_http_values_paths_and_transport_models() -> None:
     assert media_type_essence("Application/AEP+JSON; charset=utf-8") == "application/aep+json"
+    assert media_type_essence('application/aep+json; profile="one;two"') == ("application/aep+json")
+    for malformed in (
+        "application/aep+json;",
+        "application/aep+json; garbage",
+        "application/aep+json; charset=",
+        "application/aep+json\r\n",
+    ):
+        assert media_type_essence(malformed) == ""
     assert normalize_endpoint_base() == "/aep/"
     assert normalize_endpoint_base("/custom") == "/custom/"
     assert normalize_endpoint_base("/custom/") == "/custom/"
@@ -155,32 +163,50 @@ def test_did_web_document_and_public_key_selection() -> None:
     )
     assert did_web_document_url("did:web:example.com") == "https://example.com/.well-known/did.json"
     document = {
+        "id": did,
         "verificationMethod": [
             {"id": "other", "publicKeyJwk": {}},
-            {"id": key_id, "publicKeyJwk": {"kty": "OKP", "x": "key"}},
-        ]
+            {
+                "id": key_id,
+                "publicKeyJwk": {"key_ops": ["verify"], "kty": "OKP", "x": "key"},
+            },
+        ],
     }
     key = select_did_web_public_jwk(document, did=did, key_id=key_id)
-    assert key == {"kty": "OKP", "x": "key"}
+    assert key == {"key_ops": ["verify"], "kty": "OKP", "x": "key"}
     key["x"] = "changed"
+    cast(list[str], key["key_ops"]).append("sign")
     methods = cast(list[dict[str, Any]], document["verificationMethod"])
     assert methods[1]["publicKeyJwk"]["x"] == "key"
+    assert methods[1]["publicKeyJwk"]["key_ops"] == ["verify"]
     for invalid_did in (
         "did:key:one",
         "did:web:",
         "did:web:user@example.com",
         "did:web:example.com%3Fquery",
         "did:web:example.com%3Ainvalid",
+        "did:web:example.com:%2Fadmin",
+        "did:web:example.com:%2E%2E:secret",
+        "did:web:example.com:",
+        "did:web:examplé.com",
+        "did:web:%C3%A9xample.com",
     ):
         with pytest.raises(ValueError):
             did_web_document_url(invalid_did)
     with pytest.raises(ValueError, match="issuer"):
         select_did_web_public_jwk(document, did=did, key_id="did:web:other#key")
     with pytest.raises(ValueError, match="No public JWK"):
-        select_did_web_public_jwk({}, did=did, key_id=key_id)
+        select_did_web_public_jwk({"id": did}, did=did, key_id=key_id)
+    with pytest.raises(ValueError, match="document ID"):
+        select_did_web_public_jwk(
+            {**document, "id": "did:web:other.example"}, did=did, key_id=key_id
+        )
     with pytest.raises(ValueError, match="No public JWK"):
         select_did_web_public_jwk(
-            {"verificationMethod": [{"id": key_id, "publicKeyMultibase": "z123"}]},
+            {
+                "id": did,
+                "verificationMethod": [{"id": key_id, "publicKeyMultibase": "z123"}],
+            },
             did=did,
             key_id=key_id,
         )
@@ -191,14 +217,12 @@ def test_openapi_url_and_path_helpers() -> None:
         resolve_openapi_url("https://service.example/.well-known/aep", "/openapi.json")
         == "https://service.example/openapi.json"
     )
-    assert (
+    with pytest.raises(ValueError):
         resolve_openapi_url(
             "https://127.0.0.1/.well-known/aep",
             "http://127.0.0.1/openapi.json",
             allow_insecure_loopback=True,
         )
-        == "http://127.0.0.1/openapi.json"
-    )
     assert (
         resolve_openapi_url(
             "http://127.0.0.1/.well-known/aep",
@@ -222,6 +246,13 @@ def test_openapi_url_and_path_helpers() -> None:
         trailing_slash=OpenApiTrailingSlash.EQUIVALENT,
     )
     assert equivalent.template == "/items/{id}"
+    partial = match_openapi_path(
+        ("/items/{id}.json",),
+        method="get",
+        path="/items/one.json",
+        trailing_slash=OpenApiTrailingSlash.STRICT,
+    )
+    assert partial.template == "/items/{id}.json"
     for inspect_url, reference in (
         ("http://service.example/.well-known/aep", "/openapi.json"),
         ("https://user@service.example/.well-known/aep", "/openapi.json"),
@@ -250,6 +281,13 @@ def test_openapi_url_and_path_helpers() -> None:
             ("/one",),
             method="GET",
             path="/one/two",
+            trailing_slash=OpenApiTrailingSlash.STRICT,
+        )
+    with pytest.raises(ValueError, match="not documented"):
+        match_openapi_path(
+            ("/items/{id",),
+            method="GET",
+            path="/items/one",
             trailing_slash=OpenApiTrailingSlash.STRICT,
         )
     with pytest.raises(ValueError, match="Ambiguous"):

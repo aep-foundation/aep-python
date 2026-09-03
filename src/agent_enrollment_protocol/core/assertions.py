@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import json
+import re
 import time
-from base64 import urlsafe_b64decode
+from base64 import b64decode
 from dataclasses import dataclass
 from typing import Any
 
@@ -10,6 +11,8 @@ import jwt
 
 from .errors import AepAssertionError
 from .models import AssertionOperation, ClientAssertionClaims, SigningAlgorithm
+
+_BASE64URL_PATTERN = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,7 +106,7 @@ def verify_client_assertion(
 
 def decode_jwt_unverified(assertion: str) -> tuple[dict[str, Any], dict[str, Any]]:
     parts = assertion.split(".")
-    if len(parts) != 3:
+    if len(parts) != 3 or any(_BASE64URL_PATTERN.fullmatch(part) is None for part in parts):
         raise AepAssertionError("Invalid JWT.")
     try:
         header = _decode_part(parts[0])
@@ -122,8 +125,17 @@ def _require_key_binding(key_id: str, claims: ClientAssertionClaims) -> None:
 
 
 def _decode_part(value: str) -> dict[str, Any]:
-    decoded = urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
-    parsed = json.loads(decoded)
+    decoded = b64decode(value + "=" * (-len(value) % 4), altchars=b"-_", validate=True).decode()
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, item in items:
+            if key in result:
+                raise ValueError(f"duplicate object member: {key}")
+            result[key] = item
+        return result
+
+    parsed = json.loads(decoded, object_pairs_hook=pairs)
     if not isinstance(parsed, dict):
         raise ValueError("JWT part must be an object")
     return parsed

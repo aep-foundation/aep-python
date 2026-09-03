@@ -12,6 +12,7 @@ from agent_enrollment_protocol.core import (
     AgentStatus,
     AssertionOperation,
     ClientAssertionClaims,
+    InspectClaims,
     OpenApiPathMatching,
     OpenApiReference,
     OpenApiTrailingSlash,
@@ -174,10 +175,10 @@ async def test_status_and_lifecycle_boundaries() -> None:
     absent = await empty.status(_options(AssertionOperation.STATUS, "absent"))
     assert absent.status == 401
 
-    for status, code in (
-        (AgentStatus.SUSPENDED, "identity_suspended"),
-        (AgentStatus.TERMINATED, "identity_terminated"),
-        (AgentStatus.UNAVAILABLE, "identity_unavailable"),
+    for status in (
+        AgentStatus.SUSPENDED,
+        AgentStatus.TERMINATED,
+        AgentStatus.UNAVAILABLE,
     ):
         store = MemoryEnrollmentStore()
         await store.save(replace(_record(), status=status))
@@ -186,7 +187,19 @@ async def test_status_and_lifecycle_boundaries() -> None:
             b'{"agent_did":"did:web:agent.example"}',
             _options(AssertionOperation.ENROLL, f"enroll-{status}", key=f"key-{status}"),
         )
-        assert result.problem is not None and result.problem.code == code
+        assert result.status == 200
+        assert result.body is not None and result.body.status is status
+
+    store = MemoryEnrollmentStore()
+    await store.save(_record())
+    changed_requirements, _ = _service(
+        claims=InspectClaims(required=("contact.email",)), enrollment_store=store
+    )
+    existing = await changed_requirements.enroll(
+        b'{"agent_did":"did:web:agent.example"}',
+        _options(AssertionOperation.ENROLL, "existing", key="existing"),
+    )
+    assert existing.status == 200
 
     with pytest.raises(ValueError, match="UTC offsets"):
         replace(_record(), since=NOW.replace(tzinfo=None))
@@ -345,6 +358,16 @@ async def test_assertion_and_protected_resource_boundaries() -> None:
     assert unsupported.response.problem is not None
     assert unsupported.response.problem.code == "unsupported_authentication_method"
 
+    for authorization in ("Basic dXNlcjpwYXNz", "Bearer credential"):
+        unsupported = await no_jwt.authenticate_protected_resource(
+            ProtectedResourceRequest(
+                headers={"Authorization": authorization}, method="GET", url=resource
+            )
+        )
+        assert unsupported.response is not None
+        assert unsupported.response.problem is not None
+        assert unsupported.response.problem.code == "unsupported_authentication_method"
+
     unknown = await service.authenticate_protected_resource(
         ProtectedResourceRequest(
             headers={
@@ -427,6 +450,15 @@ async def test_credential_authentication_rejects_invalid_principals() -> None:
 
 @pytest.mark.asyncio
 async def test_custom_boundaries_are_validated() -> None:
+    class MismatchedEnrollmentStore(MemoryEnrollmentStore):
+        async def find(self, agent_did: str) -> EnrollmentRecord | None:
+            del agent_did
+            return replace(_record(), agent_did="did:web:other.example")
+
+    mismatched, _ = _service(enrollment_store=MismatchedEnrollmentStore())
+    with pytest.raises(ValueError, match="mismatched Agent DID"):
+        await mismatched.status(_options(AssertionOperation.STATUS, "mismatched-store"))
+
     class EmptyIdempotencyStore:
         async def execute(
             self,

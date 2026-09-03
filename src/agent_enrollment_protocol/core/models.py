@@ -34,6 +34,7 @@ RFC3339_DATETIME_PATTERN = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
+RFC3339_FULL_DATE_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 URI_SCHEME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
 
 
@@ -509,13 +510,13 @@ class CredentialResponse(AepModel):
 
 
 class OAuthBearerGrantResponse(CredentialResponse):
-    access_token: str = Field(min_length=1)
+    access_token: str = Field(min_length=1, repr=False)
     token_format: Literal["opaque", "jwt"] | None = None
     token_type: Literal["Bearer"]
 
 
 class ApiKeyGrantResponse(CredentialResponse):
-    api_key: str = Field(min_length=1)
+    api_key: str = Field(min_length=1, repr=False)
     header: str = Field(min_length=1)
 
     @model_validator(mode="after")
@@ -531,7 +532,7 @@ class ApiKeyGrantResponse(CredentialResponse):
 
 
 class BasicGrantResponse(CredentialResponse):
-    password: str = Field(min_length=1)
+    password: str = Field(min_length=1, repr=False)
     realm: str | None = Field(default=None, min_length=1)
     username: str = Field(min_length=1)
 
@@ -839,6 +840,8 @@ def parse_rfc3339(value: str) -> datetime:
 
 
 def parse_full_date(value: str) -> date:
+    if RFC3339_FULL_DATE_PATTERN.fullmatch(value) is None:
+        raise ValueError("invalid RFC 3339 full-date")
     return date.fromisoformat(value)
 
 
