@@ -101,6 +101,45 @@ Use a separate unprotected application branch for public resources. For local de
 `allow_insecure_loopback=True` permits an HTTP `localhost` or loopback resource origin; production
 origins require HTTPS.
 
+## Agent with a hosted identity Platform
+
+`PlatformIdentityProvider` lets an Agent use a remote AEP Platform for Service-scoped identity
+custody and delegated assertion signing. It discovers the Platform, recovers an existing active
+identity before provisioning one, caches discovery metadata according to HTTP cache directives,
+and supplies the resulting signer directly to `Agent`.
+
+```python
+import os
+
+from agent_enrollment_protocol.agent import (
+    Agent,
+    AgentOptions,
+    PlatformIdentityProvider,
+    PlatformIdentityProviderOptions,
+)
+
+
+async def authentication_headers() -> dict[str, str]:
+    return {"Authorization": f"Bearer {os.environ['AEP_PLATFORM_ACCESS_TOKEN']}"}
+
+
+async with PlatformIdentityProvider(
+    PlatformIdentityProviderOptions(
+        authentication_headers=authentication_headers,
+        platform_url="https://platform.example",
+    )
+) as identities:
+    async with Agent(AgentOptions(identity_provider=identities)) as agent:
+        result = await agent.service("https://service.example").enroll()
+```
+
+The Platform authentication callback is evaluated for each private request so applications can
+refresh short-lived credentials. Supply `pending_sign_resolver` when the Platform can return
+`202 Accepted` during delegated signing. The resolver receives the immutable retry interval and
+opaque Platform context; returning updated context starts the next signing stage with a distinct
+idempotency key. Without a resolver, pending signing raises `PlatformSignPendingError` for the
+application to continue explicitly.
+
 ## Hosted identity Platform
 
 `agent_enrollment_protocol.platform` implements discovery, Service-scoped Agent identity

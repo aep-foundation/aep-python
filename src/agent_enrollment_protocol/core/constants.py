@@ -3,6 +3,7 @@ from typing import Final
 AEP_VERSION: Final = "1.0"
 AEP_MEDIA_TYPE: Final = "application/aep+json"
 AEP_PROBLEM_MEDIA_TYPE: Final = "application/problem+json"
+AEP_PLATFORM_WELL_KNOWN_PATH: Final = "/.well-known/aep-platform"
 AEP_AUTH_SCHEME: Final = "AEP"
 AEP_AUTHORIZATION_HEADER: Final = "AEP-Authorization"
 AEP_WELL_KNOWN_PATH: Final = "/.well-known/aep"
