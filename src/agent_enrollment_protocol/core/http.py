@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
@@ -12,6 +13,13 @@ from .models import (
     Command,
     InspectDocument,
     ProtectedResourceAuthorization,
+)
+
+_TOKEN = r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
+_QUOTED_STRING = r'"(?:[\t !#-\[\]-~\x80-\xff]|\\[\t !-~\x80-\xff])*"'
+_MEDIA_TYPE_PATTERN = re.compile(
+    rf"\A[ \t]*(?P<type>{_TOKEN})/(?P<subtype>{_TOKEN})[ \t]*"
+    rf"(?:;[ \t]*{_TOKEN}[ \t]*=[ \t]*(?:{_TOKEN}|{_QUOTED_STRING})[ \t]*)*\Z"
 )
 
 
@@ -37,7 +45,10 @@ class HttpResponse:
 
 
 def media_type_essence(value: str) -> str:
-    return value.partition(";")[0].strip().lower()
+    match = _MEDIA_TYPE_PATTERN.fullmatch(value)
+    if match is None:
+        return ""
+    return f"{match.group('type')}/{match.group('subtype')}".lower()
 
 
 def normalize_endpoint_base(endpoint_base: str = DEFAULT_HTTP_ENDPOINT_BASE) -> str:

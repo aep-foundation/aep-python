@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
@@ -74,7 +75,7 @@ class CredentialRecord:
     expires_at: datetime
     grant_type: str
     issued_at: datetime
-    payload: bytes
+    payload: bytes = field(repr=False)
     service_did: str
     service_url: str
 
@@ -145,19 +146,21 @@ class EnrollOptions:
 class GrantOptions:
     grant_type: str | None = None
     idempotency_key: str | None = None
+    parameters: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
     preferred_grant_types: tuple[str, ...] = ()
     requested_scopes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "preferred_grant_types", tuple(self.preferred_grant_types))
+        object.__setattr__(self, "parameters", _copy_parameters(self.parameters))
         object.__setattr__(self, "requested_scopes", tuple(self.requested_scopes))
 
 
 @dataclass(frozen=True, slots=True)
 class GrantResult:
-    credential: BuiltInCredential | None
+    credential: BuiltInCredential | None = field(repr=False)
     grant_type: str
-    raw: bytes
+    raw: bytes = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,6 +169,10 @@ class RevokeOptions:
     credential_id: str | None = None
     grant_type: str | None = None
     idempotency_key: str | None = None
+    parameters: Mapping[str, object] = field(default_factory=lambda: MappingProxyType({}))
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "parameters", _copy_parameters(self.parameters))
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,3 +210,9 @@ class ClaimRequirementsError(Exception):
             "AEP Agent cannot satisfy the Service's required Claim Names: " + ", ".join(values)
         )
         self.missing = values
+
+
+def _copy_parameters(parameters: Mapping[str, object]) -> Mapping[str, object]:
+    if any(not isinstance(name, str) or not name for name in parameters):
+        raise ValueError("AEP extension parameter names must be non-empty strings")
+    return MappingProxyType(deepcopy(dict(parameters)))

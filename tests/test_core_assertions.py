@@ -203,3 +203,8 @@ def test_unverified_decoder_rejects_non_jwt_and_non_object_parts() -> None:
         decode_jwt_unverified(f"{array}.{object_part}.signature")
     with pytest.raises(AepAssertionError):
         decode_jwt_unverified("invalid.invalid.signature")
+    with pytest.raises(AepAssertionError):
+        decode_jwt_unverified(f"{object_part}!!!.{object_part}.signature")
+    duplicate = urlsafe_b64encode(b'{"value":1,"value":2}').decode().rstrip("=")
+    with pytest.raises(AepAssertionError):
+        decode_jwt_unverified(f"{duplicate}.{object_part}.signature")

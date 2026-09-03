@@ -16,6 +16,7 @@ from agent_enrollment_protocol.agent import (
     CredentialRecord,
     EnrollOptions,
     GrantOptions,
+    GrantResult,
     HttpxTransport,
     InspectCacheEntry,
     MemoryCredentialStore,
@@ -34,6 +35,7 @@ from agent_enrollment_protocol.agent.client import (
 )
 from agent_enrollment_protocol.agent.types import IdentityRequest
 from agent_enrollment_protocol.core import (
+    ApiKeyGrantResponse,
     AuthorizationCarrier,
     ClaimValues,
     ClientAssertionClaims,
@@ -43,7 +45,14 @@ from agent_enrollment_protocol.core import (
     SigningAlgorithm,
 )
 
-from .test_agent import FakeIdentityProvider, FixedKeys, QueueTransport, configured_agent, response
+from .test_agent import (
+    FakeIdentityProvider,
+    FixedKeys,
+    QueueTransport,
+    configured_agent,
+    response,
+    signed_assertion,
+)
 from .test_core_models import inspect_document
 
 
@@ -376,6 +385,117 @@ async def test_grant_selection_custom_and_inactive_boundaries() -> None:
 
 
 @pytest.mark.asyncio
+async def test_grant_and_revoke_forward_extension_parameters() -> None:
+    transport = QueueTransport(
+        response({"status": "active"}),
+        response({"custom": "credential"}),
+        response({}),
+    )
+    document = document_with(
+        authentication={"methods": ["future"]},
+        commands={
+            "supported": ["grant", "inspect", "revoke", "status"],
+            "grant_types": ["future"],
+        },
+    )
+    agent, _ = configured_agent(QueueTransport(response(document.to_wire())), transport)
+    service = agent.service("api.example.com")
+    await service.identity()
+    parameters = {"label": "workload"}
+    await service.grant(GrantOptions(grant_type="future", parameters=parameters))
+    parameters["label"] = "changed"
+    await service.revoke(RevokeOptions(grant_type="future", parameters={"reason": "rotation"}))
+    grant_body = transport.requests[1].body
+    revoke_body = transport.requests[2].body
+    assert grant_body is not None
+    assert revoke_body is not None
+    assert json.loads(grant_body) == {
+        "grant_type": "future",
+        "label": "workload",
+    }
+    assert json.loads(revoke_body) == {
+        "grant_type": "future",
+        "reason": "rotation",
+    }
+
+
+@pytest.mark.asyncio
+async def test_grant_rejects_unadvertised_api_key_header() -> None:
+    document = document_with(
+        commands={
+            "supported": ["grant", "inspect", "status"],
+            "grant_types": ["api-key"],
+            "grant_types_config": {"api-key": {"header_names": ["x-service-key"]}},
+        }
+    )
+    agent, _ = configured_agent(
+        QueueTransport(response(document.to_wire())),
+        QueueTransport(
+            response({"status": "active"}),
+            response(
+                {
+                    "api_key": "secret",
+                    "credential_id": "one",
+                    "expires_at": "2026-01-01T01:00:00Z",
+                    "header": "X-Other-Key",
+                }
+            ),
+        ),
+    )
+    await agent.service("api.example.com").identity()
+    with pytest.raises(ValueError, match="was not advertised"):
+        await agent.service("api.example.com").grant(GrantOptions(grant_type="api-key"))
+    accepted, _ = configured_agent(
+        QueueTransport(response(document.to_wire())),
+        QueueTransport(
+            response({"status": "active"}),
+            response(
+                {
+                    "api_key": "secret",
+                    "credential_id": "two",
+                    "expires_at": "2026-01-01T01:00:00Z",
+                    "header": "X-Service-Key",
+                }
+            ),
+        ),
+    )
+    await accepted.service("api.example.com").identity()
+    result = await accepted.service("api.example.com").grant(GrantOptions(grant_type="api-key"))
+    assert result.body.credential is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header_names", ["x-service-key", [1]])
+async def test_grant_rejects_invalid_api_key_header_configuration(
+    header_names: object,
+) -> None:
+    document = document_with(
+        commands={
+            "supported": ["grant", "inspect", "status"],
+            "grant_types": ["api-key"],
+            "grant_types_config": {"api-key": {"header_names": header_names}},
+        }
+    )
+    agent, _ = configured_agent(
+        QueueTransport(response(document.to_wire())),
+        QueueTransport(
+            response({"status": "active"}),
+            response(
+                {
+                    "api_key": "secret",
+                    "credential_id": "one",
+                    "expires_at": "2026-01-01T01:00:00Z",
+                    "header": "X-Service-Key",
+                }
+            ),
+        ),
+    )
+    await agent.service("api.example.com").identity()
+    with pytest.raises(ValueError, match="configuration is invalid"):
+        await agent.service("api.example.com").grant(GrantOptions(grant_type="api-key"))
+
+
+@pytest.mark.asyncio
 async def test_revoke_and_forget_boundaries() -> None:
     agent, _ = configured_agent(
         QueueTransport(response(inspect_document().to_wire())), QueueTransport(response({}))
@@ -685,6 +805,64 @@ async def test_custom_store_and_signer_fail_closed() -> None:
             AuthenticationOptions("https://api.example.com/resource", client_assertion_only=True)
         )
 
+    class AlteredAssertionProvider(FakeIdentityProvider):
+        async def signer_for(self, identity: ServiceIdentity) -> AssertionSigner:
+            async def sign(
+                claims: ClientAssertionClaims, algorithms: tuple[SigningAlgorithm, ...]
+            ) -> str:
+                del algorithms
+                payload = claims.to_wire()
+                payload["jti"] = "altered"
+                return signed_assertion(claims, payload=payload)
+
+            return sign
+
+    altered = Agent(
+        AgentOptions(
+            identity_provider=AlteredAssertionProvider(),
+            inspect_transport=QueueTransport(response(inspect_document().to_wire())),
+        )
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        await altered.service("api.example.com").status()
+
+    class MalformedAssertionProvider(FakeIdentityProvider):
+        async def signer_for(self, identity: ServiceIdentity) -> AssertionSigner:
+            async def sign(
+                claims: ClientAssertionClaims, algorithms: tuple[SigningAlgorithm, ...]
+            ) -> str:
+                return "not-a-jwt"
+
+            return sign
+
+    malformed = Agent(
+        AgentOptions(
+            identity_provider=MalformedAssertionProvider(),
+            inspect_transport=QueueTransport(response(inspect_document().to_wire())),
+        )
+    )
+    with pytest.raises(ValueError, match="invalid assertion"):
+        await malformed.service("api.example.com").status()
+
+    class WrongAlgorithmAssertionProvider(FakeIdentityProvider):
+        async def signer_for(self, identity: ServiceIdentity) -> AssertionSigner:
+            async def sign(
+                claims: ClientAssertionClaims, algorithms: tuple[SigningAlgorithm, ...]
+            ) -> str:
+                del algorithms
+                return signed_assertion(claims, algorithm="ES256")
+
+            return sign
+
+    wrong_algorithm = Agent(
+        AgentOptions(
+            identity_provider=WrongAlgorithmAssertionProvider(),
+            inspect_transport=QueueTransport(response(inspect_document().to_wire())),
+        )
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        await wrong_algorithm.service("api.example.com").status()
+
     unsupported = document_with(
         commands={"supported": ["inspect", "status"], "grant_types": ["api-key"]}
     )
@@ -723,6 +901,87 @@ def test_identity_rejects_untyped_signing_algorithms() -> None:
             "did:web:api.example.com",
             "https://api.example.com/",
         )
+    with pytest.raises(ValueError, match="Agent clock"):
+        Agent(AgentOptions(identity_provider=FakeIdentityProvider(), clock=datetime.now))
+    with pytest.raises(ValueError, match="parameter names"):
+        GrantOptions(parameters={"": True})
+    with pytest.raises(ValueError, match="parameter names"):
+        RevokeOptions(parameters=cast(dict[str, object], {1: True}))
+
+
+@pytest.mark.asyncio
+async def test_revoke_uses_authoritative_service_did_for_store_deletion() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    payload = json.dumps(
+        {
+            "api_key": "secret",
+            "credential_id": "foreign",
+            "expires_at": "2026-01-01T01:00:00Z",
+            "header": "X-Key",
+        }
+    ).encode()
+
+    class ForeignListStore:
+        def __init__(self) -> None:
+            self.deleted: list[tuple[str, str]] = []
+
+        async def delete_credential(self, service_did: str, credential_id: str) -> None:
+            self.deleted.append((service_did, credential_id))
+
+        async def find_credential(
+            self, service_did: str, credential_id: str
+        ) -> CredentialRecord | None:
+            return None
+
+        async def list_credentials(self, service_did: str) -> tuple[CredentialRecord, ...]:
+            return (
+                CredentialRecord(
+                    "foreign",
+                    now + timedelta(hours=1),
+                    "api-key",
+                    now,
+                    payload,
+                    "did:web:foreign.example",
+                    "https://foreign.example/",
+                ),
+            )
+
+        async def save_credential(self, credential: CredentialRecord) -> None:
+            pass
+
+    store = ForeignListStore()
+    agent, _ = configured_agent(
+        QueueTransport(response(inspect_document().to_wire())),
+        QueueTransport(response({})),
+        credential_store=cast(MemoryCredentialStore, store),
+    )
+    await agent.service("api.example.com").revoke(RevokeOptions(all_grant_types=True))
+    assert store.deleted == [("did:web:api.example.com", "foreign")]
+
+
+def test_credential_results_hide_secret_material_from_repr() -> None:
+    now = datetime(2026, 1, 1, tzinfo=UTC)
+    record = CredentialRecord(
+        "one",
+        now + timedelta(hours=1),
+        "api-key",
+        now,
+        b'{"api_key":"record-secret-value"}',
+        "did:web:api.example.com",
+        "https://api.example.com/",
+    )
+    result = GrantResult(
+        ApiKeyGrantResponse(
+            api_key="grant-secret-value",
+            credential_id="one",
+            expires_at="2026-01-01T01:00:00Z",
+            header="X-Key",
+        ),
+        "api-key",
+        b'{"api_key":"grant-secret-value"}',
+    )
+    assert "record-secret-value" not in repr(record)
+    assert "grant-secret-value" not in repr(result)
 
 
 @pytest.mark.asyncio

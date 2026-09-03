@@ -147,13 +147,17 @@ def _options(operation: AssertionOperation, jti: str, *, key: str | None = None)
 
 @pytest.mark.asyncio
 async def test_enroll_status_and_replay_protection() -> None:
+    store = MemoryEnrollmentStore()
     service, verifier = _service(
-        claims=InspectClaims(required=("contact.email",), preferred=("person.first_name",))
+        claims=InspectClaims(required=("contact.email",), preferred=("person.first_name",)),
+        enrollment_store=store,
     )
     body = (
         EnrollRequest(
             agent_did=AGENT_DID,
-            claims=ClaimValues.model_validate({"contact.email": "agent@example.com"}),
+            claims=ClaimValues.model_validate(
+                {"contact.email": "agent@example.com", "unadvertised": "ignored"}
+            ),
             idempotency_key="enroll-1",
         )
         .model_dump_json(by_alias=True, exclude_none=True)
@@ -166,6 +170,9 @@ async def test_enroll_status_and_replay_protection() -> None:
     assert enrolled.status == 200
     assert enrolled.body is not None and enrolled.body.status is AgentStatus.ACTIVE
     assert verifier.contexts[0].operation is AssertionOperation.ENROLL
+    record = await store.find(AGENT_DID)
+    assert record is not None and record.claims is not None
+    assert record.claims.to_wire() == {"contact.email": "agent@example.com"}
 
     replay = await service.enroll(body, _options(AssertionOperation.ENROLL, "one", key="enroll-1"))
     assert replay.status == 401

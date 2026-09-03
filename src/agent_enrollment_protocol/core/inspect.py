@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from urllib.parse import SplitResult, unquote, urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from .constants import AEP_VERSION
+from .did_web import _did_web_parts
 from .models import VERSION_PATTERN, InspectDocument
 
 
@@ -28,18 +29,12 @@ def require_service_origin_binding(
 
 
 def did_web_origin(did: str, *, allow_insecure_loopback: bool = False) -> str:
-    prefix = "did:web:"
-    if not did.startswith(prefix):
-        raise ValueError("AEP Service identity must use did:web")
-    encoded_host = did[len(prefix) :].partition(":")[0]
-    if not encoded_host:
-        raise ValueError("Invalid did:web Service identity")
-    host = unquote(encoded_host)
+    try:
+        host, _ = _did_web_parts(did)
+    except ValueError as error:
+        raise ValueError("Invalid did:web Service identity") from error
     scheme = "http" if allow_insecure_loopback and _loopback_host(host) else "https"
-    parsed = urlsplit(f"{scheme}://{host}")
-    if not parsed.hostname or parsed.username or parsed.password:
-        raise ValueError("Invalid did:web Service identity")
-    return _origin(parsed)
+    return _origin(urlsplit(f"{scheme}://{host}"))
 
 
 def same_origin(first: str, second: str) -> bool:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from urllib.parse import urljoin, urlsplit
 
 from .models import OpenApiTrailingSlash
+
+_PATH_EXPRESSION = re.compile(r"\{[^{}]+\}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,7 +22,7 @@ def match_openapi_path(
     path: str,
     trailing_slash: OpenApiTrailingSlash,
 ) -> OpenApiPathMatch:
-    if not method or not path or "?" in path:
+    if not method or not path or "?" in path or "#" in path:
         raise ValueError("Invalid OpenAPI operation target")
     request_segments = _segments(path, trailing_slash)
     matches: list[tuple[tuple[int, ...], str]] = []
@@ -29,10 +32,10 @@ def match_openapi_path(
             continue
         score: list[int] = []
         for expected, actual in zip(template_segments, request_segments, strict=True):
-            variable = expected.startswith("{") and expected.endswith("}") and len(expected) > 2
-            if not variable and expected != actual:
+            matched, templated = _match_segment(expected, actual)
+            if not matched:
                 break
-            score.append(0 if variable else 1)
+            score.append(0 if templated else 1)
         else:
             matches.append((tuple(score), template))
     if not matches:
@@ -61,6 +64,8 @@ def resolve_openapi_url(
     ):
         raise ValueError("Invalid final AEP Inspect URL")
     resolved = urlsplit(urljoin(final_inspect_url, reference))
+    if inspect.scheme == "https" and resolved.scheme != "https":
+        raise ValueError("Invalid AEP OpenAPI URL")
     allowed = resolved.scheme == "https" or (
         allow_insecure_loopback
         and resolved.scheme == "http"
@@ -84,3 +89,20 @@ def _segments(path: str, mode: OpenApiTrailingSlash) -> tuple[str, ...]:
         else path
     )
     return tuple(normalized.removeprefix("/").split("/"))
+
+
+def _match_segment(template: str, value: str) -> tuple[bool, bool]:
+    remainder = _PATH_EXPRESSION.sub("", template)
+    if "{" in remainder or "}" in remainder:
+        return False, False
+    expressions = tuple(_PATH_EXPRESSION.finditer(template))
+    if not expressions:
+        return template == value, False
+    position = 0
+    pattern: list[str] = []
+    for expression in expressions:
+        pattern.append(re.escape(template[position : expression.start()]))
+        pattern.append(r"[^/?#]+")
+        position = expression.end()
+    pattern.append(re.escape(template[position:]))
+    return re.fullmatch("".join(pattern), value) is not None, True

@@ -15,6 +15,8 @@ from pydantic import BaseModel
 
 from agent_enrollment_protocol.core import (
     AEP_AUTHENTICATION_METHOD_JWT,
+    AEP_GRANT_TYPE_BASIC,
+    AEP_GRANT_TYPE_OAUTH_BEARER,
     AEP_PROBLEM_MEDIA_TYPE,
     AEP_VERSION,
     AgentStatus,
@@ -22,6 +24,7 @@ from agent_enrollment_protocol.core import (
     AuthorizationCarrier,
     AuthorizationScheme,
     Bindings,
+    ClaimValues,
     ClientAssertionClaims,
     Command,
     Commands,
@@ -32,6 +35,7 @@ from agent_enrollment_protocol.core import (
     GrantRequest,
     HttpConfiguration,
     Identity,
+    InspectClaims,
     InspectDocument,
     ProblemDetails,
     ProtectedResourceAuthorization,
@@ -199,6 +203,9 @@ class Service:
             return _problem("invalid_request", "Invalid request", 400)
 
         async def execute() -> ServiceResult[EnrollResponse]:
+            existing = await self._enrollment_store.find(claims.sub)
+            if existing is not None:
+                return _enrollment_result(existing, claims.sub)
             required = self._document.claims.required if self._document.claims else ()
             missing = missing_required_claim_names(required or (), request.claims)
             if missing:
@@ -220,7 +227,7 @@ class Service:
                     )
                 return EnrollmentRecord(
                     agent_did=claims.sub,
-                    claims=request.claims,
+                    claims=_accepted_claims(request.claims, self._document.claims),
                     created_at=now,
                     enrollment_id=identifier,
                     owner_action_required=decision.owner_action_required,
@@ -232,7 +239,7 @@ class Service:
                 )
 
             record, _ = await self._enrollment_store.find_or_create(claims.sub, create)
-            return _enrollment_result(record)
+            return _enrollment_result(record, claims.sub)
 
         return await self._idempotent(
             claims.sub,
@@ -252,7 +259,7 @@ class Service:
         record = await self._enrollment_store.find(claims.sub)
         if record is None:
             return _problem("not_recognized", "Not recognized", 401)
-        _validate_enrollment_record(record)
+        _validate_enrollment_record(record, claims.sub)
         return ServiceResult(
             status=200,
             body=StatusResponse.model_validate(
@@ -275,7 +282,7 @@ class Service:
             record = await self._enrollment_store.find(claims.sub)
             if record is None:
                 return _problem("not_recognized", "Not recognized", 401)
-            _validate_enrollment_record(record)
+            _validate_enrollment_record(record, claims.sub)
             definition = self._grant_types.get(request.grant_type)
             if definition is None:
                 return _problem("unsupported_grant_type", "Unsupported grant type", 400)
@@ -317,7 +324,7 @@ class Service:
             record = await self._enrollment_store.find(claims.sub)
             if record is None:
                 return _problem("not_recognized", "Not recognized", 401)
-            _validate_enrollment_record(record)
+            _validate_enrollment_record(record, claims.sub)
             if request.grant_type is not None:
                 definition = self._grant_types.get(request.grant_type)
                 if definition is None:
@@ -379,6 +386,14 @@ class Service:
                     authentication_method=AEP_AUTHENTICATION_METHOD_JWT,
                 ),
             )
+        if presentation is not None:
+            method = (
+                AEP_GRANT_TYPE_BASIC
+                if presentation.scheme is AuthorizationScheme.BASIC
+                else AEP_GRANT_TYPE_OAUTH_BEARER
+            )
+            if method not in self._authentication_methods:
+                return self._protected_problem("unsupported_authentication_method", resource)
         authentication_input = CredentialAuthenticationInput(
             current_time=self._now(),
             headers=headers,
@@ -412,7 +427,7 @@ class Service:
         record = await self._enrollment_store.find(agent_did)
         if record is None:
             return False
-        _validate_enrollment_record(record)
+        _validate_enrollment_record(record, agent_did)
         return record.status is AgentStatus.ACTIVE
 
     async def _authenticate_assertion(
@@ -622,25 +637,11 @@ def _problem(
     )
 
 
-def _enrollment_result(record: EnrollmentRecord) -> ServiceResult[EnrollResponse]:
-    _validate_enrollment_record(record)
-    if record.status in {AgentStatus.ACTIVE, AgentStatus.PENDING, AgentStatus.REJECTED}:
-        return ServiceResult(
-            status=200,
-            body=EnrollResponse.model_validate(_lifecycle_data(record)),
-        )
-    code = {
-        AgentStatus.SUSPENDED: "identity_suspended",
-        AgentStatus.TERMINATED: "identity_terminated",
-        AgentStatus.UNAVAILABLE: "identity_unavailable",
-    }.get(record.status, "enrollment_failed")
-    return _problem(
-        code,
-        _title(code),
-        403 if code.startswith("identity_") else 400,
-        owner_action_required=record.owner_action_required,
-        requirements_pending=record.requirements_pending,
-        verification_pending=record.verification_pending,
+def _enrollment_result(record: EnrollmentRecord, agent_did: str) -> ServiceResult[EnrollResponse]:
+    _validate_enrollment_record(record, agent_did)
+    return ServiceResult(
+        status=200,
+        body=EnrollResponse.model_validate(_lifecycle_data(record)),
     )
 
 
@@ -842,8 +843,24 @@ def _lifecycle_data(record: EnrollmentRecord) -> dict[str, Any]:
     return data
 
 
-def _validate_enrollment_record(record: EnrollmentRecord) -> None:
+def _accepted_claims(
+    values: ClaimValues | None, advertised: InspectClaims | None
+) -> ClaimValues | None:
+    if values is None:
+        return None
+    names = (
+        (*(advertised.required or ()), *(advertised.preferred or ()), *(advertised.optional or ()))
+        if advertised is not None
+        else ()
+    )
+    accepted = {name: value for name, value in values.to_wire().items() if name in names}
+    return ClaimValues.model_validate(accepted)
+
+
+def _validate_enrollment_record(record: EnrollmentRecord, agent_did: str) -> None:
     replace(record)
+    if record.agent_did != agent_did:
+        raise ValueError("AEP enrollment store returned a mismatched Agent DID")
 
 
 def _rfc3339(value: datetime) -> str:

@@ -59,6 +59,10 @@ The Service module includes stored credential profiles for each built-in Grant T
 Each factory accepts application-owned credential issuance and storage implementations. The included
 memory store is intended for examples and local development.
 
+Concrete Grant Types and extensions can define additional Grant and Revoke request members. Pass
+those members through `GrantOptions.parameters` or `RevokeOptions.parameters`; the Agent retains
+control of the standard Grant Type and Revoke selector fields.
+
 ## Service ASGI integration
 
 `agent_enrollment_protocol.adapters` provides a framework-neutral ASGI integration with no
