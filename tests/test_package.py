@@ -1,6 +1,7 @@
 from importlib.metadata import version
 
 from agent_enrollment_protocol import __version__, adapters, agent, core, platform, service
+from agent_enrollment_protocol.adapters import AepAsgiApplication, AepAuthenticationMiddleware
 from agent_enrollment_protocol.agent import Agent, AgentOptions, HttpxTransport, ServiceIdentity
 from agent_enrollment_protocol.core import ClaimSupportEvaluation, evaluate_claim_support
 from agent_enrollment_protocol.service import (
@@ -26,6 +27,8 @@ def test_public_package_modules() -> None:
     assert ServiceIdentity.__module__ == "agent_enrollment_protocol.agent.types"
     assert Service.__module__ == "agent_enrollment_protocol.service.service"
     assert ServiceOptions.__module__ == "agent_enrollment_protocol.service.types"
+    assert AepAsgiApplication.__module__ == "agent_enrollment_protocol.adapters.asgi"
+    assert AepAuthenticationMiddleware.__module__ == "agent_enrollment_protocol.adapters.asgi"
     assert ClaimSupportEvaluation.__module__ == "agent_enrollment_protocol.core.claims"
     assert evaluate_claim_support.__module__ == "agent_enrollment_protocol.core.claims"
     assert (
