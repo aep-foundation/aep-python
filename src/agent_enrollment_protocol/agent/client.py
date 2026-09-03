@@ -40,6 +40,7 @@ from agent_enrollment_protocol.core import (
     command_path_from_inspect,
     did_web_document_url,
     media_type_essence,
+    missing_required_claim_names,
     parse_json_model,
     render_authorization,
     require_service_origin_binding,
@@ -285,8 +286,7 @@ class ServiceSession:
             if inspection.document.claims and inspection.document.claims.required
             else ()
         )
-        supplied = set(options.claims.to_wire()) if options.claims else set()
-        missing = tuple(value for value in required if value not in supplied)
+        missing = missing_required_claim_names(required, options.claims)
         if missing:
             raise ClaimRequirementsError(missing)
         key = await self._idempotency_key(inspection, Command.ENROLL.value, options.idempotency_key)
@@ -681,7 +681,10 @@ class ServiceSession:
                 )
             return record
         records = await self._agent._credential_store.list_credentials(service_did)
-        for method in methods:
+        automatic_methods = methods
+        if options.grant_type is None and AEP_AUTHENTICATION_METHOD_JWT in methods:
+            automatic_methods = methods[: methods.index(AEP_AUTHENTICATION_METHOD_JWT)]
+        for method in automatic_methods:
             for record in records:
                 if record.grant_type != method or (
                     options.grant_type is not None and record.grant_type != options.grant_type

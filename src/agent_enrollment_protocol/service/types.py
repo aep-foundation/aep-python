@@ -9,7 +9,9 @@ from typing import Generic, Protocol, TypeVar
 
 from agent_enrollment_protocol.core import (
     AgentStatus,
+    ApiKeyGrantResponse,
     AssertionOperation,
+    BasicGrantResponse,
     ClaimValues,
     ClientAssertionClaims,
     EnrollmentDecisionStatus,
@@ -17,6 +19,7 @@ from agent_enrollment_protocol.core import (
     GrantRequest,
     GrantTypeConfig,
     InspectClaims,
+    OAuthBearerGrantResponse,
     OpenApiReference,
     ProblemDetails,
     RevokeRequest,
@@ -27,6 +30,8 @@ BodyT = TypeVar("BodyT")
 StoredOperation = Callable[[], Awaitable["StoredResponse"]]
 EnrollmentFactory = Callable[[], Awaitable["EnrollmentRecord"]]
 HeaderValue = str | Sequence[str]
+BuiltInCredential = ApiKeyGrantResponse | BasicGrantResponse | OAuthBearerGrantResponse
+CredentialT = TypeVar("CredentialT", bound=BuiltInCredential)
 
 
 @dataclass(frozen=True, slots=True)
@@ -214,6 +219,64 @@ class CredentialAuthenticator(Protocol):
     ) -> AuthenticatedPrincipal | None: ...
 
     async def has_presentation(self, request: CredentialAuthenticationInput) -> bool: ...
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceCredentialRecord:
+    agent_did: str
+    created_at: datetime
+    credential: BuiltInCredential
+    credential_id: str
+    expires_at: datetime
+    grant_type: str
+
+    def __post_init__(self) -> None:
+        if self.created_at.utcoffset() is None or self.expires_at.utcoffset() is None:
+            raise ValueError("AEP credential record timestamps must contain UTC offsets")
+
+
+@dataclass(frozen=True, slots=True)
+class CredentialMatch:
+    agent_did: str
+    credential_id: str
+    expires_at: datetime
+    grant_type: str
+    scopes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "scopes", tuple(self.scopes))
+        if self.expires_at.utcoffset() is None:
+            raise ValueError("AEP credential match expiration must contain a UTC offset")
+
+
+class ServiceCredentialStore(Protocol):
+    async def authenticate_credential(
+        self, grant_type: str, request: CredentialAuthenticationInput
+    ) -> CredentialMatch | None: ...
+
+    async def has_credential_presentation(
+        self, grant_type: str, request: CredentialAuthenticationInput
+    ) -> bool: ...
+
+    async def revoke_credential(
+        self, agent_did: str, grant_type: str, credential_id: str, revoked_at: datetime
+    ) -> None: ...
+
+    async def revoke_grant_type(
+        self, agent_did: str, grant_type: str, revoked_at: datetime
+    ) -> None: ...
+
+    async def save_credential(self, record: ServiceCredentialRecord) -> None: ...
+
+
+BuiltInCredentialIssuer = Callable[[GrantRequest, GrantContext], Awaitable[CredentialT]]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredCredentialGrantTypeOptions(Generic[CredentialT]):
+    issue: BuiltInCredentialIssuer[CredentialT]
+    store: ServiceCredentialStore
+    config: GrantTypeConfig = field(default_factory=GrantTypeConfig)
 
 
 @dataclass(frozen=True, slots=True)

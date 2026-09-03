@@ -41,6 +41,7 @@ from agent_enrollment_protocol.core import (
     SigningAlgorithm,
     StatusResponse,
     decode_jwt_unverified,
+    missing_required_claim_names,
     normalize_endpoint_base,
     parse_authorization,
     parse_json_model,
@@ -199,7 +200,7 @@ class Service:
 
         async def execute() -> ServiceResult[EnrollResponse]:
             required = self._document.claims.required if self._document.claims else ()
-            missing = _missing_claims(required or (), request)
+            missing = missing_required_claim_names(required or (), request.claims)
             if missing:
                 return _problem(
                     "requirements_unmet",
@@ -673,11 +674,6 @@ def _grant_definitions(
 
 def _valid_idempotency_key(value: str | None) -> TypeGuard[str]:
     return value is not None and bool(value.strip())
-
-
-def _missing_claims(required: Sequence[str], request: EnrollRequest) -> tuple[str, ...]:
-    claims = request.claims.to_wire() if request.claims is not None else {}
-    return tuple(name for name in required if name not in claims)
 
 
 def _claims_within_limits(claims: object, limits: ClaimValueLimits) -> bool:

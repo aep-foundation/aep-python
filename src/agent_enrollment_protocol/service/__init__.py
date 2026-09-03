@@ -1,5 +1,11 @@
 """Service-side enrollment, credential issuance, and authentication integration."""
 
+from .credentials import (
+    MemoryServiceCredentialStore,
+    stored_api_key_grant_type,
+    stored_basic_grant_type,
+    stored_oauth_bearer_grant_type,
+)
 from .service import Service
 from .stores import (
     MemoryEnrollmentStore,
@@ -12,10 +18,13 @@ from .types import (
     AssertionVerifier,
     AuthenticatedPrincipal,
     AuthenticationKind,
+    BuiltInCredential,
+    BuiltInCredentialIssuer,
     ClaimValueLimits,
     CommandOptions,
     CredentialAuthenticationInput,
     CredentialAuthenticator,
+    CredentialMatch,
     EnrollmentDecision,
     EnrollmentPolicy,
     EnrollmentRecord,
@@ -32,8 +41,11 @@ from .types import (
     ReplayRecord,
     ReplayStore,
     RevokeContext,
+    ServiceCredentialRecord,
+    ServiceCredentialStore,
     ServiceOptions,
     ServiceResult,
+    StoredCredentialGrantTypeOptions,
     StoredResponse,
 )
 
@@ -42,10 +54,13 @@ __all__ = [
     "AssertionVerifier",
     "AuthenticatedPrincipal",
     "AuthenticationKind",
+    "BuiltInCredential",
+    "BuiltInCredentialIssuer",
     "ClaimValueLimits",
     "CommandOptions",
     "CredentialAuthenticationInput",
     "CredentialAuthenticator",
+    "CredentialMatch",
     "EnrollmentDecision",
     "EnrollmentPolicy",
     "EnrollmentRecord",
@@ -60,14 +75,21 @@ __all__ = [
     "MemoryEnrollmentStore",
     "MemoryIdempotencyStore",
     "MemoryReplayStore",
+    "MemoryServiceCredentialStore",
     "ProtectedResourceRequest",
     "ProtectedResourceResult",
     "ReplayRecord",
     "ReplayStore",
     "RevokeContext",
     "Service",
+    "ServiceCredentialRecord",
+    "ServiceCredentialStore",
     "ServiceOptions",
     "ServiceResult",
     "StaticEnrollmentPolicy",
+    "StoredCredentialGrantTypeOptions",
     "StoredResponse",
+    "stored_api_key_grant_type",
+    "stored_basic_grant_type",
+    "stored_oauth_bearer_grant_type",
 ]

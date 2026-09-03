@@ -254,7 +254,7 @@ async def test_grant_stores_and_revoke_forgets_api_key() -> None:
     result = await service.grant(GrantOptions(grant_type="api-key"))
     assert isinstance(result.body.credential, ApiKeyGrantResponse)
     assert await service.authentication_headers(
-        AuthenticationOptions(resource="https://api.example.com/products")
+        AuthenticationOptions(resource="https://api.example.com/products", grant_type="api-key")
     ) == {"X-API-Key": "secret"}
     revoked = await service.revoke(
         RevokeOptions(grant_type="api-key", credential_id="credential-one")
