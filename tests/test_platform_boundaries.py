@@ -9,6 +9,7 @@ import pytest
 
 from agent_enrollment_protocol.core import (
     AssertionOperation,
+    ClientAssertionClaims,
     ManagedAgentStatus,
     PlatformAgentIdentity,
     PlatformLifecycleRequest,
@@ -20,6 +21,7 @@ from agent_enrollment_protocol.core import (
     PlatformVerificationResponse,
     ProblemDetails,
     SigningAlgorithm,
+    sign_client_assertion,
 )
 from agent_enrollment_protocol.platform import (
     DidVerificationMethod,
@@ -434,6 +436,60 @@ async def test_platform_operation_boundaries() -> None:
     with pytest.raises(ValueError, match="unauthorized"):
         await unauthorized.list(IdentityListQuery(), context(key=None))
 
+    class MismatchedLookupStore(MemoryIdentityStore):
+        async def get(self, agent_identity_id: str) -> IdentityRecord | None:
+            del agent_identity_id
+            return replace(record(), agent_identity_id="pai_other", principal="owner-one")
+
+        async def find_by_agent_did_id(self, agent_did_id: str) -> IdentityRecord | None:
+            del agent_did_id
+            return replace(record(), agent_did_id="other")
+
+    mismatched_lookup = Platform(options(identity_store=MismatchedLookupStore()))
+    with pytest.raises(ValueError, match="mismatched"):
+        await mismatched_lookup.get_identity("pai_one", context(key=None))
+    with pytest.raises(ValueError, match="mismatched"):
+        await mismatched_lookup.did_document("one")
+
+    class MismatchedUpdateStore(MemoryIdentityStore):
+        async def update_status(
+            self,
+            agent_identity_id: str,
+            status: ManagedAgentStatus,
+            updated_at: datetime,
+        ) -> IdentityRecord | None:
+            updated = await super().update_status(agent_identity_id, status, updated_at)
+            return None if updated is None else replace(updated, service_did="did:web:other")
+
+    mismatched_update = Platform(options(identity_store=MismatchedUpdateStore()))
+    update_id, _ = await provisioned(mismatched_update)
+    with pytest.raises(ValueError, match="mismatched"):
+        await mismatched_update.update_identity(
+            update_id,
+            PlatformLifecycleRequest(status=ManagedAgentStatus.SUSPENDED),
+            context(key=None),
+        )
+
+    class InvalidListStore(MemoryIdentityStore):
+        async def list(self, principal: str, query: IdentityListQuery) -> IdentityListResult:
+            del principal, query
+            item = replace(record(), principal="owner-one")
+            return IdentityListResult((item, item), 1)
+
+    invalid_list = Platform(options(identity_store=InvalidListStore()))
+    with pytest.raises(ValueError, match="invalid list"):
+        await invalid_list.list(IdentityListQuery(), context(key=None))
+
+    class MalformedListStore(MemoryIdentityStore):
+        async def list(self, principal: str, query: IdentityListQuery) -> IdentityListResult:
+            del principal, query
+            item = replace(record(), created_at=NOW.replace(tzinfo=None), principal="owner-one")
+            return IdentityListResult((item,), 1)
+
+    malformed_list = Platform(options(identity_store=MalformedListStore()))
+    with pytest.raises(ValueError, match="unauthorized"):
+        await malformed_list.list(IdentityListQuery(), context(key=None))
+
 
 @pytest.mark.asyncio
 async def test_sign_handler_validation() -> None:
@@ -521,20 +577,34 @@ async def test_sign_handler_optional_and_completed_fields() -> None:
     assert authenticated.body.platform_context == {"handle": "opaque"}
     assert received[0].platform_context == {"changed": True, "handle": "opaque"}
 
-    good = PlatformSignCompleted(
-        status="completed",
-        agent_did=authenticated.body.agent_did,
-        client_assertion="jwt",
-        expires_at="2026-01-02T03:04:35Z",
-        issued_at="2026-01-02T03:04:05Z",
-        jti="custom",
-        service_did=SERVICE_DID,
-    )
+    keys = KeyStore()
 
-    async def completed(*_: Any) -> PlatformResult[Any]:
-        return PlatformResult(200, good, "application/aep+json")
+    async def completed(value: Any, request_context: Any) -> PlatformResult[Any]:
+        del request_context
+        claims = ClientAssertionClaims(
+            aud=SERVICE_DID,
+            exp=int(NOW.timestamp()) + 30,
+            iat=int(NOW.timestamp()),
+            iss=value.identity.agent_did,
+            jti="custom",
+            op=AssertionOperation.STATUS,
+            sub=value.identity.agent_did,
+        )
+        return PlatformResult(
+            200,
+            PlatformSignCompleted(
+                status="completed",
+                agent_did=value.identity.agent_did,
+                client_assertion=await keys.sign(value.identity, claims),
+                expires_at="2026-01-02T03:04:35Z",
+                issued_at="2026-01-02T03:04:05Z",
+                jti="custom",
+                service_did=SERVICE_DID,
+            ),
+            "application/aep+json",
+        )
 
-    custom = Platform(options(sign_handler=completed))
+    custom = Platform(options(key_store=keys, sign_handler=completed))
     custom_id, _ = await provisioned(custom)
     result = await custom.sign(
         custom_id,
@@ -548,6 +618,37 @@ async def test_sign_handler_optional_and_completed_fields() -> None:
     )
     assert isinstance(result.body, PlatformSignCompleted)
     assert result.body.jti == "custom"
+
+    class InvalidSigner(KeyStore):
+        async def sign(self, identity: IdentityRecord, claims: ClientAssertionClaims) -> str:
+            del identity, claims
+            return "not-a-jwt"
+
+    invalid_signer = Platform(options(key_store=InvalidSigner()))
+    invalid_id, _ = await provisioned(invalid_signer)
+    with pytest.raises(ValueError, match="invalid client assertion"):
+        await invalid_signer.sign(
+            invalid_id,
+            PlatformSignRequest(
+                jti="invalid", op=AssertionOperation.STATUS, service_did=SERVICE_DID
+            ),
+            context("invalid-signer"),
+        )
+
+    class MismatchedSigner(KeyStore):
+        async def sign(self, identity: IdentityRecord, claims: ClientAssertionClaims) -> str:
+            return await super().sign(identity, claims.model_copy(update={"jti": "other"}))
+
+    mismatched_signer = Platform(options(key_store=MismatchedSigner()))
+    signer_id, _ = await provisioned(mismatched_signer)
+    with pytest.raises(ValueError, match="mismatched assertion claims"):
+        await mismatched_signer.sign(
+            signer_id,
+            PlatformSignRequest(
+                jti="mismatched", op=AssertionOperation.STATUS, service_did=SERVICE_DID
+            ),
+            context("mismatched-signer"),
+        )
 
 
 @pytest.mark.asyncio
@@ -618,6 +719,69 @@ async def test_hosted_verification_rejects_unrecognized_assertions() -> None:
     )
     assert isinstance(invalid_signature.body, PlatformVerificationResponse)
     assert invalid_signature.body.verified is False
+
+    unknown_did = "did:web:platform.example:agents:unknown"
+    unknown_assertion = sign_client_assertion(
+        ClientAssertionClaims(
+            aud=SERVICE_DID,
+            exp=int(NOW.timestamp()) + 30,
+            iat=int(NOW.timestamp()),
+            iss=unknown_did,
+            jti="unknown",
+            op=AssertionOperation.STATUS,
+            sub=unknown_did,
+        ),
+        key=keys.key,
+        algorithm=SigningAlgorithm.ES256,
+    )
+    unknown = await platform.verify(
+        PlatformVerificationRequest(
+            client_assertion=unknown_assertion,
+            op=AssertionOperation.STATUS,
+            service_did=SERVICE_DID,
+        ),
+        context("verify-unknown"),
+    )
+    assert isinstance(unknown.body, PlatformVerificationResponse)
+    assert unknown.body.verified is False
+
+    class MismatchedVerificationStore(MemoryIdentityStore):
+        async def find_by_agent_did(self, agent_did: str) -> IdentityRecord | None:
+            identity = await super().find_by_agent_did(agent_did)
+            return (
+                None
+                if identity is None
+                else replace(identity, agent_did="did:web:other", key_id="did:web:other")
+            )
+
+    mismatched_store = MismatchedVerificationStore()
+    mismatched = Platform(
+        options(
+            discovery=discovery,
+            hosted_verification=True,
+            identity_store=mismatched_store,
+            key_store=keys,
+            replay_store=MemoryReplayStore(),
+        )
+    )
+    mismatched_id, _ = await provisioned(mismatched)
+    mismatched_signed = await mismatched.sign(
+        mismatched_id,
+        PlatformSignRequest(
+            jti="mismatched", op=AssertionOperation.STATUS, service_did=SERVICE_DID
+        ),
+        context("mismatched-sign"),
+    )
+    assert isinstance(mismatched_signed.body, PlatformSignCompleted)
+    with pytest.raises(ValueError, match="mismatched"):
+        await mismatched.verify(
+            PlatformVerificationRequest(
+                client_assertion=mismatched_signed.body.client_assertion,
+                op=AssertionOperation.STATUS,
+                service_did=SERVICE_DID,
+            ),
+            context("mismatched-verify"),
+        )
 
     header, _, signature = signed.body.client_assertion.split(".")
     import base64
