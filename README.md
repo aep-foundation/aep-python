@@ -32,6 +32,48 @@ protocols.
 
 Framework integrations are optional and remain separate from Core and role behavior.
 
+## Hosted identity Platform
+
+`agent_enrollment_protocol.platform` implements discovery, Service-scoped Agent identity
+provisioning, DID document publication, identity listing and lifecycle, delegated signing, and
+optional hosted verification.
+
+Applications supply caller authorization, Service DID resolution, key custody, and durable stores.
+The included memory stores are suitable for local development, not production key custody or
+durable idempotency.
+
+```python
+from datetime import timedelta
+
+from agent_enrollment_protocol.core import SigningAlgorithm
+from agent_enrollment_protocol.platform import DiscoveryOptions, Platform, PlatformOptions
+
+platform = Platform(
+    PlatformOptions(
+        authorizer=authorizer,
+        did_host="platform.example",
+        did_url_template="https://platform.example/agents/{agent_did_id}/did.json",
+        discovery=DiscoveryOptions(
+            endpoint_base="/v1/aep",
+            lifecycle_endpoint="/v1/aep/agent-identities/{agent_identity_id}",
+            list_endpoint="/v1/aep/agent-identities",
+            platform_name="Example Platform",
+            provision_endpoint="/v1/aep/agent-identities",
+            sign_endpoint="/v1/aep/agent-identities/{agent_identity_id}/sign",
+        ),
+        key_store=key_store,
+        maximum_lifetime=timedelta(minutes=5),
+        service_did_resolver=service_did_resolver,
+        signing_algorithms=(SigningAlgorithm.ES256,),
+    )
+)
+```
+
+Map `platform.discovery()` to `/.well-known/aep-platform` and the remaining methods to the paths
+advertised by `DiscoveryOptions`. Authenticate private Platform routes before constructing their
+`RequestContext`; the Platform also invokes the supplied authorizer for every private operation.
+Enable hosted verification only with a replay store.
+
 ## Development
 
 Install the locked development environment and run the complete merge gate:
