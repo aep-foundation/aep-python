@@ -15,7 +15,15 @@ from importlib.metadata import version
 
 from agent_enrollment_protocol import adapters, agent, core, platform, service
 from agent_enrollment_protocol.agent import Agent, AgentOptions, HttpxTransport, ServiceIdentity
-from agent_enrollment_protocol.service import Service, ServiceOptions
+from agent_enrollment_protocol.core import ClaimSupportEvaluation, evaluate_claim_support
+from agent_enrollment_protocol.service import (
+    MemoryServiceCredentialStore,
+    Service,
+    ServiceOptions,
+    stored_api_key_grant_type,
+    stored_basic_grant_type,
+    stored_oauth_bearer_grant_type,
+)
 
 assert __version__ == version("agent-enrollment-protocol")
 assert adapters.__name__ == "agent_enrollment_protocol.adapters"
@@ -29,4 +37,13 @@ assert HttpxTransport.__module__ == "agent_enrollment_protocol.agent.transport"
 assert ServiceIdentity.__module__ == "agent_enrollment_protocol.agent.types"
 assert Service.__module__ == "agent_enrollment_protocol.service.service"
 assert ServiceOptions.__module__ == "agent_enrollment_protocol.service.types"
+assert ClaimSupportEvaluation.__module__ == "agent_enrollment_protocol.core.claims"
+assert evaluate_claim_support.__module__ == "agent_enrollment_protocol.core.claims"
+assert MemoryServiceCredentialStore.__module__ == "agent_enrollment_protocol.service.credentials"
+for factory in (
+    stored_api_key_grant_type,
+    stored_basic_grant_type,
+    stored_oauth_bearer_grant_type,
+):
+    assert factory.__module__ == "agent_enrollment_protocol.service.credentials"
 PY

@@ -516,6 +516,17 @@ async def test_authentication_selection_boundaries() -> None:
             "https://api.example.com/resource", credential_id="one", grant_type="api-key"
         )
     ) == {"X-Key": "secret"}
+    jwt_preferred = document_with(authentication={"methods": ["aep-jwt", "api-key"]})
+    preferred, _ = configured_agent(
+        QueueTransport(response(jwt_preferred.to_wire())),
+        QueueTransport(),
+        credential_store=store,
+    )
+    assert (
+        await preferred.service("api.example.com").authentication_headers(
+            AuthenticationOptions("https://api.example.com/resource")
+        )
+    )["Authorization"].startswith("AEP ")
     for options, message in (
         (
             AuthenticationOptions("https://api.example.com/resource", credential_id="missing"),

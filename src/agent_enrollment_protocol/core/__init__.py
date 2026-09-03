@@ -6,6 +6,7 @@ from .assertions import (
     sign_client_assertion,
     verify_client_assertion,
 )
+from .claims import ClaimSupportEvaluation, evaluate_claim_support, missing_required_claim_names
 from .constants import (
     AEP_ASSERTION_OPERATIONS,
     AEP_AUTH_SCHEME,
@@ -166,6 +167,7 @@ __all__ = [
     "AuthorizationScheme",
     "BasicGrantResponse",
     "Bindings",
+    "ClaimSupportEvaluation",
     "ClaimValues",
     "ClientAssertionClaims",
     "Command",
@@ -226,9 +228,11 @@ __all__ = [
     "decode_jwt_unverified",
     "did_web_document_url",
     "did_web_origin",
+    "evaluate_claim_support",
     "is_version_compatible",
     "match_openapi_path",
     "media_type_essence",
+    "missing_required_claim_names",
     "normalize_endpoint_base",
     "parse_authorization",
     "parse_json_model",
