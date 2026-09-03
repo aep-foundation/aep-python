@@ -7,7 +7,7 @@ import secrets
 from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from types import MappingProxyType
 from typing import Protocol, TypeVar
 from urllib.parse import quote, urlencode, urljoin, urlsplit, urlunsplit
@@ -628,7 +628,8 @@ def _cache_fresh(entry: PlatformDiscoveryCacheEntry, now: datetime) -> bool:
             return False
         if seconds < 0:
             return False
-    return now < entry.cached_at + timedelta(seconds=seconds)
+    elapsed = (now - entry.cached_at).total_seconds()
+    return 0 <= elapsed < seconds
 
 
 def _cache_directive(value: str, name: str) -> str | None:
