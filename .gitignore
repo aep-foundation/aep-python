@@ -1,4 +1,5 @@
-/.conformance/
+/.conformance/aep-specs/
+/.conformance/reports/
 /.mypy_cache/
 /.pytest_cache/
 /.ruff_cache/

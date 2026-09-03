@@ -152,6 +152,15 @@ uv sync --all-groups --locked
 make verify
 ```
 
+Run the shared Agent, Service, and Platform conformance suites against the public Python APIs:
+
+```sh
+make conformance
+```
+
+The command reads the adjacent `../aep-specs` checkout by default and writes role reports to
+`.conformance/reports/`. Set `AEP_SPECS_DIR` when the specifications are checked out elsewhere.
+
 See [`aep-specs`](https://github.com/aep-foundation/aep-specs) for the normative drafts, schemas,
 registries, examples, and test vectors.
 
