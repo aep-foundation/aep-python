@@ -15,8 +15,18 @@ from importlib.metadata import version
 
 from agent_enrollment_protocol import adapters, agent, core, platform, service
 from agent_enrollment_protocol.adapters import AepAsgiApplication, AepAuthenticationMiddleware
-from agent_enrollment_protocol.agent import Agent, AgentOptions, HttpxTransport, ServiceIdentity
-from agent_enrollment_protocol.core import ClaimSupportEvaluation, evaluate_claim_support
+from agent_enrollment_protocol.agent import (
+    Agent,
+    AgentOptions,
+    HttpxTransport,
+    PlatformIdentityProvider,
+    ServiceIdentity,
+)
+from agent_enrollment_protocol.core import (
+    AEP_PLATFORM_WELL_KNOWN_PATH,
+    ClaimSupportEvaluation,
+    evaluate_claim_support,
+)
 from agent_enrollment_protocol.service import (
     MemoryServiceCredentialStore,
     Service,
@@ -35,6 +45,8 @@ assert service.__name__ == "agent_enrollment_protocol.service"
 assert Agent.__module__ == "agent_enrollment_protocol.agent.client"
 assert AgentOptions.__module__ == "agent_enrollment_protocol.agent.client"
 assert HttpxTransport.__module__ == "agent_enrollment_protocol.agent.transport"
+assert PlatformIdentityProvider.__module__ == "agent_enrollment_protocol.agent.platform_provider"
+assert AEP_PLATFORM_WELL_KNOWN_PATH == "/.well-known/aep-platform"
 assert ServiceIdentity.__module__ == "agent_enrollment_protocol.agent.types"
 assert Service.__module__ == "agent_enrollment_protocol.service.service"
 assert ServiceOptions.__module__ == "agent_enrollment_protocol.service.types"

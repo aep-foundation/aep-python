@@ -4,6 +4,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 from agent_enrollment_protocol.core import (
+    AEP_PLATFORM_WELL_KNOWN_PATH,
     AEP_VERSION,
     PlatformDiscoveryDocument,
     PlatformEndpoints,
@@ -18,7 +19,7 @@ from .types import DidVerificationMethod, DiscoveryOptions, IdentityRecord
 
 DID_MEDIA_TYPE = "application/did+json"
 HOSTED_IDENTITY_DRAFT = "draft-kavian-aep-platform-hosted-identity-01"
-WELL_KNOWN_PATH = "/.well-known/aep-platform"
+WELL_KNOWN_PATH = AEP_PLATFORM_WELL_KNOWN_PATH
 _DID_CONTEXT = "https://www.w3.org/ns/did/v1"
 _DID_PLACEHOLDER = "{agent_did_id}"
 

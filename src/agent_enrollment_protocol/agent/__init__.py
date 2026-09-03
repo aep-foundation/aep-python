@@ -1,6 +1,20 @@
 """Agent-side enrollment, credential, and authentication workflows."""
 
 from .client import Agent, AgentOptions, ServiceSession
+from .platform_provider import (
+    MemoryPlatformDiscoveryCache,
+    PlatformAuthenticationHeaders,
+    PlatformCommandError,
+    PlatformContextProvider,
+    PlatformDiscoveryCache,
+    PlatformDiscoveryCacheEntry,
+    PlatformIdempotencyKeyFactory,
+    PlatformIdentityProvider,
+    PlatformIdentityProviderOptions,
+    PlatformPendingSign,
+    PlatformPendingSignResolver,
+    PlatformSignPendingError,
+)
 from .stores import (
     MemoryCredentialStore,
     MemoryIdentityStore,
@@ -61,7 +75,19 @@ __all__ = [
     "MemoryCredentialStore",
     "MemoryIdentityStore",
     "MemoryInspectCache",
+    "MemoryPlatformDiscoveryCache",
     "OperationKey",
+    "PlatformAuthenticationHeaders",
+    "PlatformCommandError",
+    "PlatformContextProvider",
+    "PlatformDiscoveryCache",
+    "PlatformDiscoveryCacheEntry",
+    "PlatformIdempotencyKeyFactory",
+    "PlatformIdentityProvider",
+    "PlatformIdentityProviderOptions",
+    "PlatformPendingSign",
+    "PlatformPendingSignResolver",
+    "PlatformSignPendingError",
     "RandomIdempotencyKeyProvider",
     "RevokeOptions",
     "ServiceIdentity",
