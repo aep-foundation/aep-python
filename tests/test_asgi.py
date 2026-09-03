@@ -53,7 +53,7 @@ async def invoke(
     pending = list(messages or [{"type": "http.request", "body": body}])
     sent: list[AsgiMessage] = []
     scope: AsgiScope = {
-        "headers": list(headers) if isinstance(headers, Iterable) else headers,
+        "headers": headers,
         "path": path,
         "query_string": query_string,
         "type": scope_type,
@@ -143,9 +143,15 @@ async def test_asgi_application_serves_and_revalidates_inspect() -> None:
     assert wildcard.status == 304
 
     rejected = await invoke(application, method="POST", path="/.well-known/aep")
-    assert rejected.status == 405
+    assert rejected.status == 400
     assert rejected.headers["allow"] == "GET"
     assert rejected.headers["content-type"] == "application/problem+json"
+    assert json.loads(rejected.body) == {
+        "code": "invalid_request",
+        "status": 400,
+        "title": "Invalid request",
+        "type": "urn:aep:error:invalid_request",
+    }
 
 
 @pytest.mark.asyncio
@@ -261,7 +267,7 @@ async def test_asgi_application_rejects_invalid_command_requests() -> None:
     application = AepAsgiApplication(service, maximum_request_body_bytes=4)
 
     wrong_method = await invoke(application, method="GET", path="/aep/enroll")
-    assert wrong_method.status == 405
+    assert wrong_method.status == 400
     assert wrong_method.headers["allow"] == "POST"
 
     for headers in (
@@ -275,7 +281,8 @@ async def test_asgi_application_rejects_invalid_command_requests() -> None:
             method="POST",
             path="/aep/enroll",
         )
-        assert media.status == 415
+        assert media.status == 400
+        assert json.loads(media.body)["code"] == "invalid_request"
 
     large = await invoke(
         application,
@@ -287,7 +294,8 @@ async def test_asgi_application_rejects_invalid_command_requests() -> None:
         method="POST",
         path="/aep/enroll",
     )
-    assert large.status == 413
+    assert large.status == 400
+    assert json.loads(large.body)["code"] == "invalid_request"
 
     disconnected = await invoke(
         application,
@@ -475,11 +483,19 @@ async def test_asgi_rejects_malformed_server_messages_and_response_headers(
     for headers in (
         object(),
         cast(Any, "invalid"),
+        cast(Any, [1]),
         cast(Any, [(b"name",)]),
         cast(Any, [("name", b"value")]),
     ):
         with pytest.raises(RuntimeError, match="header"):
             await invoke(application, headers=headers, path="/.well-known/aep")
+
+    iterable_headers = await invoke(
+        application,
+        headers=iter(((b"if-none-match", b'"unrelated"'),)),
+        path="/.well-known/aep",
+    )
+    assert iterable_headers.status == 200
 
     with pytest.raises(RuntimeError, match="invalid request message"):
         await invoke(
@@ -581,9 +597,18 @@ async def test_authentication_middleware_builds_encoded_resource_url() -> None:
         middleware,
         headers=[(b"x-key", b"secret")],
         path="/café",
+        raw_path=b"/caf\xc3\xa9",
     )
     assert response.status == 204
     assert authenticator.requests[0].url == "https://service.example/caf%C3%A9"
+
+    encoded_percent = await invoke(
+        middleware,
+        headers=[(b"x-key", b"secret")],
+        path="/100% ready",
+    )
+    assert encoded_percent.status == 204
+    assert authenticator.requests[1].url == "https://service.example/100%25%20ready"
 
     with pytest.raises(RuntimeError, match="query string"):
         await invoke(
