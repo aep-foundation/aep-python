@@ -3,9 +3,9 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
-from collections.abc import Awaitable, Callable, Mapping, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
 from typing import Any, Protocol
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, quote_from_bytes, urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
@@ -112,7 +112,13 @@ class AepAsgiApplication:
 
     async def _serve_inspect(self, scope: AsgiScope, send: AsgiSend) -> None:
         if scope.get("method") != "GET":
-            await _send_problem(send, 405, "Method Not Allowed", headers={"Allow": "GET"})
+            await _send_problem(
+                send,
+                400,
+                "Invalid request",
+                code="invalid_request",
+                headers={"Allow": "GET"},
+            )
             return
 
         headers = _request_headers(scope)
@@ -147,7 +153,13 @@ class AepAsgiApplication:
     ) -> None:
         expected_method = "GET" if command is Command.STATUS else "POST"
         if scope.get("method") != expected_method:
-            await _send_problem(send, 405, "Method Not Allowed", headers={"Allow": expected_method})
+            await _send_problem(
+                send,
+                400,
+                "Invalid request",
+                code="invalid_request",
+                headers={"Allow": expected_method},
+            )
             return
 
         headers = _request_headers(scope)
@@ -158,14 +170,14 @@ class AepAsgiApplication:
             return
 
         if not _single_media_type(headers.get("content-type"), AEP_MEDIA_TYPE):
-            await _send_problem(send, 415, "Unsupported Media Type")
+            await _send_problem(send, 400, "Invalid request", code="invalid_request")
             return
         try:
             body = await _read_body(receive, self._maximum_request_body_bytes)
         except _RequestDisconnected:
             return
         if body is None:
-            await _send_problem(send, 413, "Content Too Large")
+            await _send_problem(send, 400, "Invalid request", code="invalid_request")
             return
         options = CommandOptions(
             client_assertion=assertion,
@@ -280,17 +292,20 @@ async def _send_problem(
     status: int,
     title: str,
     *,
+    code: str | None = None,
     headers: Mapping[str, str] | None = None,
 ) -> None:
     response_headers = dict(headers or {})
     response_headers["Cache-Control"] = "no-store"
     response_headers["Content-Type"] = AEP_PROBLEM_MEDIA_TYPE
-    await _send_response(
-        send,
-        status,
-        _json_bytes({"status": status, "title": title, "type": "about:blank"}),
-        response_headers,
-    )
+    problem = {
+        "status": status,
+        "title": title,
+        "type": f"urn:aep:error:{code}" if code is not None else "about:blank",
+    }
+    if code is not None:
+        problem["code"] = code
+    await _send_response(send, status, _json_bytes(problem), response_headers)
 
 
 async def _send_response(
@@ -322,12 +337,15 @@ async def _send_response(
 def _request_headers(scope: Mapping[str, Any]) -> Mapping[str, str | Sequence[str]]:
     grouped: dict[str, list[str]] = {}
     raw_headers = scope.get("headers", ())
-    if not isinstance(raw_headers, Sequence):
-        raise RuntimeError("AEP ASGI request headers must be a sequence")
+    if not isinstance(raw_headers, Iterable):
+        raise RuntimeError("AEP ASGI request headers must be iterable")
     for item in raw_headers:
-        if not isinstance(item, Sequence) or len(item) != 2:
+        if not isinstance(item, Iterable):
             raise RuntimeError("AEP ASGI request header entries must be pairs")
-        raw_name, raw_value = item
+        try:
+            raw_name, raw_value = item
+        except (TypeError, ValueError) as error:
+            raise RuntimeError("AEP ASGI request header entries must be pairs") from error
         if not isinstance(raw_name, bytes) or not isinstance(raw_value, bytes):
             raise RuntimeError("AEP ASGI request headers must contain bytes")
         name = raw_name.decode("latin-1").lower()
@@ -407,9 +425,9 @@ def _is_loopback(hostname: str) -> bool:
 def _resource_url(origin: tuple[str, str], scope: Mapping[str, Any]) -> str:
     raw_path = scope.get("raw_path")
     if isinstance(raw_path, bytes):
-        path = raw_path.decode("ascii")
+        path = quote_from_bytes(raw_path, safe="/%:@!$&'()*+,;=-._~")
     else:
-        path = quote(_scope_text(scope, "path"), safe="/%:@!$&'()*+,;=-._~")
+        path = quote(_scope_text(scope, "path"), safe="/:@!$&'()*+,;=-._~")
     raw_query = scope.get("query_string", b"")
     if not isinstance(raw_query, bytes):
         raise RuntimeError("AEP ASGI query string must be bytes")
