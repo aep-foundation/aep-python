@@ -1,0 +1,21 @@
+{
+  "claims": [
+    {
+      "profiles": ["core-http", "claims", "api-key", "basic", "oauth-bearer"],
+      "role": "agent"
+    },
+    {
+      "profiles": ["platform-hosted-identity"],
+      "role": "platform"
+    },
+    {
+      "profiles": ["core-http", "claims", "api-key", "basic", "oauth-bearer"],
+      "role": "service"
+    }
+  ],
+  "implementation": {
+    "name": "aep-python",
+    "version": "0.0.0-development"
+  },
+  "manifest_version": "1"
+}

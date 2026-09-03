@@ -54,3 +54,45 @@ jobs:
           path: coverage.xml
           if-no-files-found: error
           retention-days: 7
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out AEP specifications
+        uses: actions/checkout@v7
+        with:
+          repository: aep-foundation/aep-specs
+          path: .conformance/aep-specs
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: .conformance/aep-specs/ietf
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.11.8"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - run: uv sync --all-groups --locked --python "3.11"
+
+      - name: Run shared conformance harness
+        run: make conformance
+        env:
+          AEP_SPECS_DIR: .conformance/aep-specs
+
+      - name: Upload conformance reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: aep-python-conformance
+          path: .conformance/reports/*.json
+          if-no-files-found: error
+          retention-days: 7
