@@ -32,6 +32,33 @@ protocols.
 
 Framework integrations are optional and remain separate from Core and role behavior.
 
+## Runnable examples
+
+The repository includes self-contained examples that exercise real signed protocol flows without
+external infrastructure:
+
+```sh
+uv run python examples/agent_service.py
+uv run python examples/hosted_platform.py
+```
+
+The first example composes an Agent, Service, every built-in credential profile, protected resource,
+and the framework-neutral ASGI adapter. The second demonstrates hosted identity Platform discovery,
+Service DID resolution, provisioning, DID publication, delegated signing, and identity listing. See
+[`examples/README.md`](./examples/README.md) for the integration boundaries and production
+replacements.
+
+The Service module includes stored credential profiles for each built-in Grant Type:
+
+| Grant Type | Factory |
+| --- | --- |
+| API key | `stored_api_key_grant_type()` |
+| Basic | `stored_basic_grant_type()` |
+| OAuth Bearer | `stored_oauth_bearer_grant_type()` |
+
+Each factory accepts application-owned credential issuance and storage implementations. The included
+memory store is intended for examples and local development.
+
 ## Service ASGI integration
 
 `agent_enrollment_protocol.adapters` provides a framework-neutral ASGI integration with no

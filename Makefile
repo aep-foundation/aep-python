@@ -1,4 +1,4 @@
-.PHONY: build consumer-smoke format format-check lint sync test typecheck verify
+.PHONY: build consumer-smoke examples format format-check lint sync test typecheck verify
 
 sync:
 	uv sync --all-groups --locked
@@ -27,4 +27,8 @@ build:
 consumer-smoke: build
 	./scripts/verify-consumer.sh
 
-verify: lint typecheck test consumer-smoke
+examples:
+	uv run python examples/agent_service.py
+	uv run python examples/hosted_platform.py
+
+verify: lint typecheck test examples consumer-smoke

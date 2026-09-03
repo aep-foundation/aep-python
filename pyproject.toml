@@ -51,6 +51,7 @@ dev = [
 
 [tool.hatch.build.targets.sdist]
 include = [
+  "/examples",
   "/LICENSE",
   "/README.md",
   "/src",
@@ -63,7 +64,7 @@ packages = ["src/agent_enrollment_protocol"]
 [tool.mypy]
 python_version = "3.11"
 strict = true
-files = ["src", "tests"]
+files = ["examples", "src", "tests"]
 
 [tool.pytest.ini_options]
 addopts = [
@@ -89,7 +90,7 @@ show_missing = true
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-src = ["src", "tests"]
+src = ["examples", "src", "tests"]
 
 [tool.ruff.lint]
 select = ["B", "E", "F", "I", "RUF", "SIM", "UP"]
