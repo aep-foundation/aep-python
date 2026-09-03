@@ -15,6 +15,7 @@ from importlib.metadata import version
 
 from agent_enrollment_protocol import adapters, agent, core, platform, service
 from agent_enrollment_protocol.agent import Agent, AgentOptions, HttpxTransport, ServiceIdentity
+from agent_enrollment_protocol.service import Service, ServiceOptions
 
 assert __version__ == version("agent-enrollment-protocol")
 assert adapters.__name__ == "agent_enrollment_protocol.adapters"
@@ -26,4 +27,6 @@ assert Agent.__module__ == "agent_enrollment_protocol.agent.client"
 assert AgentOptions.__module__ == "agent_enrollment_protocol.agent.client"
 assert HttpxTransport.__module__ == "agent_enrollment_protocol.agent.transport"
 assert ServiceIdentity.__module__ == "agent_enrollment_protocol.agent.types"
+assert Service.__module__ == "agent_enrollment_protocol.service.service"
+assert ServiceOptions.__module__ == "agent_enrollment_protocol.service.types"
 PY

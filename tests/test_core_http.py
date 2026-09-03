@@ -115,6 +115,29 @@ def test_inspect_version_origin_and_did_web_helpers() -> None:
             did_web_origin(did)
     with pytest.raises(ValueError, match="HTTPS"):
         require_service_origin_binding(document, "http://api.example.com/.well-known/aep")
+    loopback = inspect_document()
+    loopback = loopback.model_copy(
+        update={"service": loopback.service.model_copy(update={"did": "did:web:localhost%3A8080"})}
+    )
+    require_service_origin_binding(
+        loopback,
+        "http://localhost:8080/.well-known/aep",
+        allow_insecure_loopback=True,
+    )
+    default_loopback = loopback.model_copy(
+        update={"service": loopback.service.model_copy(update={"did": "did:web:localhost"})}
+    )
+    require_service_origin_binding(
+        default_loopback,
+        "http://localhost/.well-known/aep",
+        allow_insecure_loopback=True,
+    )
+    with pytest.raises(ValueError, match="does not match"):
+        require_service_origin_binding(
+            loopback,
+            "http://localhost:8081/.well-known/aep",
+            allow_insecure_loopback=True,
+        )
     with pytest.raises(ValueError, match="host"):
         _origin(urlsplit("relative"))
 

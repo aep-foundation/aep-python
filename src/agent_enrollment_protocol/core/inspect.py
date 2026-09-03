@@ -12,14 +12,22 @@ def is_version_compatible(received: str, supported: str = AEP_VERSION) -> bool:
     return received.partition(".")[0] == supported.partition(".")[0]
 
 
-def require_service_origin_binding(document: InspectDocument, final_inspect_url: str) -> None:
-    origin = _https_origin(final_inspect_url)
-    did_origin = did_web_origin(document.service.did)
+def require_service_origin_binding(
+    document: InspectDocument,
+    final_inspect_url: str,
+    *,
+    allow_insecure_loopback: bool = False,
+) -> None:
+    origin = _inspect_origin(final_inspect_url, allow_insecure_loopback)
+    did_origin = did_web_origin(
+        document.service.did,
+        allow_insecure_loopback=allow_insecure_loopback,
+    )
     if origin != did_origin:
         raise ValueError("AEP Service DID does not match the final Inspect response origin")
 
 
-def did_web_origin(did: str) -> str:
+def did_web_origin(did: str, *, allow_insecure_loopback: bool = False) -> str:
     prefix = "did:web:"
     if not did.startswith(prefix):
         raise ValueError("AEP Service identity must use did:web")
@@ -27,7 +35,8 @@ def did_web_origin(did: str) -> str:
     if not encoded_host:
         raise ValueError("Invalid did:web Service identity")
     host = unquote(encoded_host)
-    parsed = urlsplit(f"https://{host}")
+    scheme = "http" if allow_insecure_loopback and _loopback_host(host) else "https"
+    parsed = urlsplit(f"{scheme}://{host}")
     if not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("Invalid did:web Service identity")
     return _origin(parsed)
@@ -37,11 +46,25 @@ def same_origin(first: str, second: str) -> bool:
     return _origin(urlsplit(first)) == _origin(urlsplit(second))
 
 
-def _https_origin(value: str) -> str:
+def _inspect_origin(value: str, allow_insecure_loopback: bool) -> str:
     parsed = urlsplit(value)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+    insecure_loopback = (
+        allow_insecure_loopback
+        and parsed.scheme == "http"
+        and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+    )
+    if (
+        (parsed.scheme != "https" and not insecure_loopback)
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+    ):
         raise ValueError("AEP Inspect URL must be an absolute HTTPS URL")
     return _origin(parsed)
+
+
+def _loopback_host(value: str) -> bool:
+    return urlsplit(f"//{value}").hostname in {"localhost", "127.0.0.1", "::1"}
 
 
 def _origin(parsed: SplitResult) -> str:

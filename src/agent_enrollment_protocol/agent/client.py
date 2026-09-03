@@ -188,7 +188,11 @@ class ServiceSession:
                     InspectDocument,
                     "Inspect document",
                 )
-                require_service_origin_binding(document, cached.final_url)
+                require_service_origin_binding(
+                    document,
+                    cached.final_url,
+                    allow_insecure_loopback=self._agent._allow_insecure_loopback,
+                )
                 cached = replace(cached, document=document)
             except (AepValidationError, ValueError):
                 await self._agent._inspect_cache.delete_inspect(inspect_url)
@@ -250,7 +254,11 @@ class ServiceSession:
                 raise ValueError("AEP Inspect response media type is invalid")
             _bounded(response.body, self._agent._maximum_response_bytes)
             document = parse_json_model(response.body, InspectDocument, "Inspect document")
-            require_service_origin_binding(document, current)
+            require_service_origin_binding(
+                document,
+                current,
+                allow_insecure_loopback=self._agent._allow_insecure_loopback,
+            )
             entry = InspectCacheEntry(
                 cached_at=now,
                 document=document,
