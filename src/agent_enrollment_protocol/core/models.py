@@ -254,7 +254,7 @@ class HttpConfiguration(AepModel):
 
 
 class Identity(AepModel):
-    methods: tuple[str, ...]
+    methods: StringTuple
 
     @model_validator(mode="after")
     def validate_methods(self) -> Self:
