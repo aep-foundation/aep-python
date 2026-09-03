@@ -50,3 +50,6 @@ for factory in (
 ):
     assert factory.__module__ == "agent_enrollment_protocol.service.credentials"
 PY
+
+"$consumer/.venv/bin/python" "$repository/examples/agent_service.py"
+"$consumer/.venv/bin/python" "$repository/examples/hosted_platform.py"
