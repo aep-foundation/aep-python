@@ -1,4 +1,4 @@
-.PHONY: build conformance consumer-smoke examples format format-check lint sync test typecheck verify
+.PHONY: build conformance consumer-smoke examples format format-check interoperability lint sync test typecheck verify
 
 sync:
 	uv sync --all-groups --locked
@@ -33,5 +33,9 @@ examples:
 
 conformance:
 	./scripts/run-conformance.sh
+
+interoperability:
+	uv run mypy scripts/node_interoperability.py
+	./scripts/run-node-interoperability.sh
 
 verify: lint typecheck test examples consumer-smoke

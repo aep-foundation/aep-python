@@ -200,6 +200,16 @@ make conformance
 The command reads the adjacent `../aep-specs` checkout by default and writes role reports to
 `.conformance/reports/`. Set `AEP_SPECS_DIR` when the specifications are checked out elsewhere.
 
+Run bidirectional Agent, Service, and Platform interoperability against the Node.js SDK:
+
+```sh
+make interoperability
+```
+
+The command reads the adjacent `../aep-node` checkout by default and writes a four-row evidence
+report to `.interop/reports/aep-python-node-interoperability.json`. Set `AEP_NODE_DIR` when the
+Node.js SDK is checked out elsewhere.
+
 See [`aep-specs`](https://github.com/aep-foundation/aep-specs) for the normative drafts, schemas,
 registries, examples, and test vectors.
 

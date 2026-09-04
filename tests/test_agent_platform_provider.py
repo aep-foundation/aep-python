@@ -279,6 +279,42 @@ async def test_recovers_existing_identity_with_authenticated_list() -> None:
 
 
 @pytest.mark.asyncio
+async def test_loopback_platform_preserves_canonical_https_did_document_url() -> None:
+    agent_did = "did:web:127.0.0.1%3A4310:agents:one"
+    transport = QueueTransport(
+        json_response(
+            discovery(
+                identity={
+                    "did_methods": ["did:web"],
+                    "did_url_template": "https://127.0.0.1:4310/agents/{agent_did_id}/did.json",
+                }
+            )
+        ),
+        json_response(
+            listed(
+                identity(
+                    agent_did=agent_did,
+                    did_document_url="https://127.0.0.1:4310/agents/one/did.json",
+                    key_id=agent_did,
+                )
+            )
+        ),
+    )
+    instance = provider(
+        transport,
+        allow_insecure_loopback=True,
+        platform_url="http://127.0.0.1:4310",
+    )
+
+    recovered = await instance.find_identity_by_service_did(SERVICE_DID)
+
+    assert recovered is not None
+    assert recovered.metadata["did_document_url"] == "https://127.0.0.1:4310/agents/one/did.json"
+    await instance.aclose()
+    assert not transport.closed
+
+
+@pytest.mark.asyncio
 async def test_provisions_when_recovery_is_empty_and_serializes_concurrent_calls() -> None:
     keys = iter(("provision-one", "provision-two"))
 

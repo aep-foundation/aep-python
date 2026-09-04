@@ -1,0 +1,67 @@
+name: Node.js interoperability
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/interoperability.yml"
+      - "Makefile"
+      - "pyproject.toml"
+      - "scripts/node_interoperability.py"
+      - "scripts/run-node-interoperability.sh"
+      - "scripts/verify-node-interoperability.mjs"
+      - "src/**"
+      - "uv.lock"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  interoperability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: aep-python
+
+      - uses: actions/checkout@v7
+        with:
+          repository: aep-foundation/aep-node
+          path: aep-node
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.11.8"
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - run: corepack enable
+
+      - name: Install Python dependencies
+        working-directory: aep-python
+        run: uv sync --all-groups --locked
+
+      - name: Install Node.js dependencies
+        working-directory: aep-node
+        run: pnpm install --frozen-lockfile
+
+      - name: Run bidirectional interoperability
+        working-directory: aep-python
+        run: make interoperability
+        env:
+          AEP_INTEROP_OUTPUT_DIR: .interop/reports
+          AEP_NODE_DIR: ../aep-node
+
+      - name: Upload interoperability report
+        uses: actions/upload-artifact@v7
+        with:
+          name: aep-python-node-interoperability
+          path: aep-python/.interop/reports/aep-python-node-interoperability.json
+          if-no-files-found: error
+          retention-days: 7
