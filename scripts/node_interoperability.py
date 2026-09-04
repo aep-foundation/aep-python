@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import base64
 import json
+import os
 from collections.abc import Mapping
 from datetime import timedelta
 from typing import Any, cast
@@ -228,6 +229,7 @@ class InteropApplication:
 
     def _create_platform(self, listen: str) -> Platform:
         encoded_host = listen.replace(":", "%3A")
+        platform_service_did = os.environ.get("AEP_INTEROP_SERVICE_DID") or self._service_did
         return Platform(
             PlatformOptions(
                 authorizer=InteropAuthorizer(),
@@ -244,7 +246,7 @@ class InteropApplication:
                     sign_endpoint="/platform/agent-identities/{agent_identity_id}/sign",
                 ),
                 key_store=EphemeralKeyStore(),
-                service_did_resolver=InteropServiceDidResolver(self._service_did),
+                service_did_resolver=InteropServiceDidResolver(platform_service_did),
                 signing_algorithms=(SigningAlgorithm.ES256,),
             )
         )
