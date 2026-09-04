@@ -1,0 +1,198 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: aep-python-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    if: github.repository == 'aep-foundation/aep-python'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          version: "0.11.8"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Validate release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "Releases must run from main." >&2
+            exit 1
+          fi
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "The project version must be a stable semantic version such as 0.1.0." >&2
+            exit 1
+          fi
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists." >&2
+            exit 1
+          fi
+          if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+            tag_commit=$(git rev-list -n 1 "$tag")
+            if [[ "$tag_commit" != "$GITHUB_SHA" ]]; then
+              echo "Tag $tag does not identify the selected main commit." >&2
+              exit 1
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - run: uv sync --all-groups --locked --python 3.14
+
+      - name: Check out AEP specifications
+        uses: actions/checkout@v7
+        with:
+          repository: aep-foundation/aep-specs
+          path: .conformance/aep-specs
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+          working-directory: .conformance/aep-specs/ietf
+
+      - name: Check out Node.js reference implementation
+        uses: actions/checkout@v7
+        with:
+          repository: aep-foundation/aep-node
+          path: .interop/aep-node
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - run: corepack enable
+
+      - name: Install Node.js reference implementation
+        run: pnpm --dir .interop/aep-node install --frozen-lockfile
+
+      - name: Verify release
+        run: make verify conformance interoperability
+        env:
+          AEP_NODE_DIR: .interop/aep-node
+          AEP_PYTHON: python
+          AEP_SPECS_DIR: .conformance/aep-specs
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: aep-python-distributions
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload verification reports
+        uses: actions/upload-artifact@v7
+        with:
+          name: aep-python-release-reports
+          path: |
+            .conformance/reports/*.json
+            .interop/reports/aep-python-node-interoperability.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: verify
+    environment: release
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: aep-python-distributions
+          path: dist
+
+      - name: Download verification reports
+        uses: actions/download-artifact@v8
+        with:
+          name: aep-python-release-reports
+
+      - name: Create release tag
+        env:
+          TAG: ${{ needs.verify.outputs.tag }}
+        run: |
+          if git rev-parse --verify "refs/tags/$TAG" >/dev/null 2>&1; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --annotate "$TAG" --message "AEP Python $TAG" "$GITHUB_SHA"
+          git push origin "$TAG"
+
+      - name: Attest distributions
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Check PyPI version
+        id: registry
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          if curl --fail --silent --show-error \
+            "https://pypi.org/pypi/agent-enrollment-protocol/$VERSION/json" >/dev/null; then
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "published=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to PyPI
+        if: steps.registry.outputs.published != 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Verify PyPI consumer
+        run: ./scripts/verify-consumer.sh
+        env:
+          AEP_CONSUMER_SOURCE: registry
+          AEP_PYTHON: python
+          AEP_PYTHON_VERSION: ${{ needs.verify.outputs.version }}
+
+      - name: Publish GitHub release
+        run: >-
+          gh release create "${{ needs.verify.outputs.tag }}"
+          .conformance/reports/agent.json#aep-python-agent-conformance.json
+          .conformance/reports/platform.json#aep-python-platform-conformance.json
+          .conformance/reports/service.json#aep-python-service-conformance.json
+          .interop/reports/aep-python-node-interoperability.json#aep-python-node-interoperability.json
+          dist/*
+          --generate-notes
+          --title "AEP Python ${{ needs.verify.outputs.tag }}"
+          --verify-tag
+        env:
+          GH_TOKEN: ${{ github.token }}

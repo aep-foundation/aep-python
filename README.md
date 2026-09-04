@@ -213,6 +213,13 @@ Node.js SDK is checked out elsewhere.
 See [`aep-specs`](https://github.com/aep-foundation/aep-specs) for the normative drafts, schemas,
 registries, examples, and test vectors.
 
+## Releases
+
+Maintainers run the `Release` workflow from `main`. It verifies the package and a clean consumer,
+runs shared conformance and Node.js interoperability, publishes through PyPI Trusted Publishing,
+attests the distributions, and creates the matching tag and GitHub release with the verification
+reports.
+
 ## Security
 
 See [SECURITY.md](./SECURITY.md) for vulnerability reporting.

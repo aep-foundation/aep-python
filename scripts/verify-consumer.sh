@@ -7,8 +7,27 @@ trap 'rm -rf "$consumer"' EXIT
 
 python=${AEP_PYTHON:-"$repository/.venv/bin/python"}
 "$python" -m venv "$consumer/.venv"
-requirement=("$repository"/dist/agent_enrollment_protocol-*.whl)
-"$consumer/.venv/bin/python" -m pip install --disable-pip-version-check "${requirement[@]}"
+source=${AEP_CONSUMER_SOURCE:-wheel}
+if [[ "$source" == "wheel" ]]; then
+  requirement=("$repository"/dist/agent_enrollment_protocol-*.whl)
+  "$consumer/.venv/bin/python" -m pip install --disable-pip-version-check "${requirement[@]}"
+elif [[ "$source" == "registry" ]]; then
+  version=${AEP_PYTHON_VERSION:?AEP_PYTHON_VERSION is required for a registry consumer check}
+  requirement=("agent-enrollment-protocol==$version")
+  for attempt in {1..12}; do
+    if "$consumer/.venv/bin/python" -m pip install --disable-pip-version-check \
+      "${requirement[@]}"; then
+      break
+    fi
+    if [[ "$attempt" == 12 ]]; then
+      exit 1
+    fi
+    sleep 5
+  done
+else
+  echo "AEP_CONSUMER_SOURCE must be wheel or registry." >&2
+  exit 1
+fi
 "$consumer/.venv/bin/python" - <<'PY'
 from agent_enrollment_protocol import __version__
 from importlib.metadata import version
