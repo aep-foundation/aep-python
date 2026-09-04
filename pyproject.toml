@@ -47,6 +47,7 @@ dev = [
   "pytest-cov==7.1.0",
   "ruff==0.16.5",
   "twine==7.0.0",
+  "uvicorn==0.52.4",
 ]
 
 [tool.hatch.build.targets.sdist]

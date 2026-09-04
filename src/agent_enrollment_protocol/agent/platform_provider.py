@@ -193,7 +193,7 @@ class PlatformIdentityProvider:
             ),
         )
         for candidate in listed.data:
-            _validate_platform_identity(candidate, self._allow_insecure_loopback)
+            _validate_platform_identity(candidate)
             if (
                 candidate.service_did == service_did
                 and candidate.status is ManagedAgentStatus.ACTIVE
@@ -223,7 +223,7 @@ class PlatformIdentityProvider:
                     body, PlatformAgentIdentity, "Platform provision response"
                 ),
             )
-            _validate_platform_identity(created, self._allow_insecure_loopback)
+            _validate_platform_identity(created)
             if (
                 created.service_did != request.service_did
                 or created.status is not ManagedAgentStatus.ACTIVE
@@ -484,10 +484,7 @@ class PlatformIdentityProvider:
             or not identity.signing_algorithms
         ):
             raise ValueError("AEP identity is not an active identity from this Platform")
-        expected = did_web_document_url(
-            identity.agent_did,
-            allow_insecure_loopback=self._allow_insecure_loopback,
-        )
+        expected = did_web_document_url(identity.agent_did)
         if identity.metadata.get("did_document_url") != expected:
             raise ValueError("AEP Platform DID document URL does not match the Agent DID")
 
@@ -538,18 +535,14 @@ def _endpoint(platform_url: str, path: str, *, agent_identity_id: str | None = N
     return urljoin(platform_url, path)
 
 
-def _validate_platform_identity(
-    value: PlatformAgentIdentity, allow_insecure_loopback: bool
-) -> None:
+def _validate_platform_identity(value: PlatformAgentIdentity) -> None:
     if (
         not value.agent_did.startswith("did:web:")
         or value.key_id != value.agent_did
         or not value.signing_algorithms
     ):
         raise ValueError("AEP Platform returned an invalid identity")
-    expected = did_web_document_url(
-        value.agent_did, allow_insecure_loopback=allow_insecure_loopback
-    )
+    expected = did_web_document_url(value.agent_did)
     if value.did_document_url != expected:
         raise ValueError("AEP Platform DID document URL does not match the Agent DID")
 
