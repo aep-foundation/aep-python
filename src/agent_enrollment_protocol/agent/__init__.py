@@ -15,6 +15,7 @@ from .platform_provider import (
     PlatformPendingSignResolver,
     PlatformSignPendingError,
 )
+from .protected_resource import FetchProtectedResourceOptions, fetch_protected_resource
 from .stores import (
     MemoryCredentialStore,
     MemoryIdentityStore,
@@ -31,8 +32,10 @@ from .types import (
     CommandResult,
     CredentialRecord,
     CredentialStore,
+    CredentialUnavailableError,
     EnrollmentStateError,
     EnrollOptions,
+    ExistingIdentityProvider,
     GrantOptions,
     GrantResult,
     IdempotencyKeyProvider,
@@ -60,8 +63,11 @@ __all__ = [
     "CommandResult",
     "CredentialRecord",
     "CredentialStore",
+    "CredentialUnavailableError",
     "EnrollOptions",
     "EnrollmentStateError",
+    "ExistingIdentityProvider",
+    "FetchProtectedResourceOptions",
     "GrantOptions",
     "GrantResult",
     "HttpxTransport",
@@ -93,4 +99,5 @@ __all__ = [
     "ServiceIdentity",
     "ServiceSession",
     "WaitOptions",
+    "fetch_protected_resource",
 ]

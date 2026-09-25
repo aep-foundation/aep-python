@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 from pydantic import ValidationError
@@ -64,7 +65,94 @@ from agent_enrollment_protocol.core import (
     SigningAlgorithm,
     StatusResponse,
 )
-from agent_enrollment_protocol.core.models import AepModel, _is_mailbox
+from agent_enrollment_protocol.core.models import AepModel, _is_mailbox, parse_rfc3339
+
+
+@pytest.mark.parametrize("field", ["contact_email", "contact.email"])
+def test_claim_constructor_rejects_explicit_null_for_alias_and_python_name(field: str) -> None:
+    with pytest.raises(ValidationError, match="omitted"):
+        ClaimValues.model_validate({field: None})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ops@[192.0.2.1]",
+        "ops@[IPv6:2001:db8::1]",
+        "ops@[ipv6:2001:db8::1]",
+        "ops@[example-tag:literal]",
+        '"owner@name"@example.com',
+        '"owner name"@example.com',
+        '"a\\"b"@example.com',
+        "owner+tag@example.com",
+        "ops@[001.002.003.004]",
+    ],
+)
+def test_mailbox_accepts_smtp_quoted_parts_and_address_literals(value: str) -> None:
+    assert ClaimValues.model_validate({"contact_email": value}).contact_email == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "owner(comment)@example.com",
+        " owner@example.com",
+        "owner@example.com ",
+        "owner\t@example.com",
+        "owner@name@example.com",
+        '"unclosed@example.com',
+        '"a\\"@example.com',
+        '"a"b@example.com',
+        "ops@[256.0.0.1]",
+        "ops@[IPv6:bad]",
+        "ops@[IPv6:fe80::1%eth0]",
+        "ops@[tag:]",
+        "ops@[tag:has space]",
+        "ops@[missing]",
+        "ops@[127.0.0.1",
+        "ops@127.0.0.1]",
+        '"a.b"@-bad.example',
+    ],
+)
+def test_mailbox_rejects_header_syntax_and_invalid_literals(value: str) -> None:
+    with pytest.raises(ValidationError, match=r"contact.email"):
+        ClaimValues.model_validate({"contact_email": value})
+
+
+def test_rfc3339_accepts_case_variants_without_normalizing_invalid_offsets() -> None:
+    expected = parse_rfc3339("2026-01-01T12:00:00Z")
+    assert parse_rfc3339("2026-01-01t12:00:00z") == expected
+    assert parse_rfc3339("2026-01-01t12:00:00+00:00") == expected
+    for offset in ("+00:60", "-00:60", "+24:00", "-24:00"):
+        with pytest.raises(ValueError):
+            parse_rfc3339("2026-01-01T12:00:00" + offset)
+
+
+@pytest.mark.parametrize("resource", ["https://resource.example/#", "http://localhost:9900/#"])
+def test_empty_resource_fragments_are_rejected(resource: str) -> None:
+    with pytest.raises(ValidationError, match="fragment"):
+        ClientAssertionClaims.model_validate_json(
+            json.dumps(
+                {
+                    "aud": "did:web:s.example",
+                    "iss": "did:web:a.example",
+                    "sub": "did:web:a.example",
+                    "iat": 1,
+                    "exp": 61,
+                    "jti": "id",
+                    "op": "authenticate",
+                    "resource": resource,
+                }
+            ),
+            context={"allow_insecure_loopback": True},
+        )
+    with pytest.raises(ValidationError, match="fragment"):
+        PlatformSignRequest(
+            service_did="did:web:s.example",
+            jti="id",
+            op=AssertionOperation.AUTHENTICATE,
+            resource=resource,
+        )
 
 
 def test_registered_protocol_constants() -> None:
@@ -183,6 +271,12 @@ def test_inspect_and_command_models_are_immutable_and_forward_compatible() -> No
             "URI-reference",
         ),
         (lambda: HttpConfiguration(endpoint_base="https://example.com"), "origin-relative"),
+        # CORE-HTTP-004 appends the command path to endpoint_base with one `/` separator, so a base
+        # carrying a query, a fragment, or a dot segment cannot carry a command.
+        (lambda: HttpConfiguration(endpoint_base="/aep/?next="), "origin-relative"),
+        (lambda: HttpConfiguration(endpoint_base="/aep/#fragment"), "origin-relative"),
+        (lambda: HttpConfiguration(endpoint_base="/aep/../admin/"), "origin-relative"),
+        (lambda: HttpConfiguration(endpoint_base="/aep/./"), "origin-relative"),
         (lambda: Identity(methods=("DID:web",)), "identifier"),
         (lambda: ServiceIdentity(did="https://example.com"), "DID"),
         (
@@ -316,6 +410,62 @@ def test_claim_validation_boundaries() -> None:
             first_name="A",
             last_name="B",
             line1="1 Main",
+        )
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "owner@ex\u00e1mple.com",
+        "owner@ex\u0663mple.com",
+        "\u00f3wner@example.com",
+        "owner@\u0435xample.com",
+    ],
+)
+def test_mailbox_is_ascii(value: str) -> None:
+    # CLM-CAT-001 binds contact.email to the RFC 5321 Mailbox rule as the JSON Schema `email`
+    # format references it, which is ASCII; a Unicode mailbox is the separate `idn-email` format.
+    # Accepting one would let a homograph domain stand in for the ASCII domain it resembles.
+    assert not _is_mailbox(value)
+    with pytest.raises(ValidationError, match=re.escape("contact.email")):
+        ClaimValues.model_validate({"contact.email": value})
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:password@platform.example/agents/1/did.json",
+        "https://user@platform.example/agents/1/did.json",
+    ],
+)
+def test_https_urls_refuse_user_information(url: str) -> None:
+    # User information carries credentials the document is not bound to and makes the authority
+    # ambiguous to a reader, so it is refused here as it is on every other URL this package takes.
+    with pytest.raises(ValidationError, match="user info"):
+        PlatformAgentIdentity(
+            agent_did="did:web:platform.example:agents:1",
+            agent_identity_id="pai_1",
+            created_at="2026-01-01T00:00:00Z",
+            did_document_url=url,
+            key_id="did:web:platform.example:agents:1#key-1",
+            service_did="did:web:api.service.example",
+            signing_algorithms=(SigningAlgorithm.ES256,),
+            status=ManagedAgentStatus.ACTIVE,
+            updated_at="2026-01-01T00:00:00Z",
+        )
+
+
+def test_assertion_resource_refuses_user_information() -> None:
+    with pytest.raises(ValidationError, match="user info"):
+        ClientAssertionClaims(
+            aud="did:web:api.service.example",
+            exp=1_000_300,
+            iat=1_000_000,
+            iss="did:web:agent.example",
+            jti="assertion-1",
+            op=AssertionOperation.AUTHENTICATE,
+            resource="https://user@api.service.example/orders/1",
+            sub="did:web:agent.example",
         )
 
 

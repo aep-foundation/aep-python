@@ -335,17 +335,33 @@ async def test_custom_pending_signer_and_lifetime() -> None:
         context("pending"),
     )
     assert result.status == 202
-    with pytest.raises(ValueError, match="configured maximum"):
-        await platform.sign(
-            identity_id,
-            PlatformSignRequest(
-                jti="long",
-                lifetime_seconds="61",
-                op=AssertionOperation.STATUS,
-                service_did=SERVICE_DID,
-            ),
-            context("long"),
-        )
+    # PLT-SIGN-011: a caller-supplied lifetime above the configured maximum is a rejected request,
+    # not an unhandled failure, so it is answered as Problem Details before the idempotency store.
+    rejected = await platform.sign(
+        identity_id,
+        PlatformSignRequest(
+            jti="long",
+            lifetime_seconds="61",
+            op=AssertionOperation.STATUS,
+            service_did=SERVICE_DID,
+        ),
+        context("long"),
+    )
+    assert rejected.status == 400
+    assert rejected.problem is not None
+    assert rejected.problem.code == "invalid_request"
+    # An unauthorized caller reaches the same answer rather than an exception escaping the API.
+    unauthorized = await platform.sign(
+        "pai_unknown",
+        PlatformSignRequest(
+            jti="long",
+            lifetime_seconds="61",
+            op=AssertionOperation.STATUS,
+            service_did=SERVICE_DID,
+        ),
+        context("unauthorized"),
+    )
+    assert unauthorized.status == 400
 
 
 @pytest.mark.asyncio

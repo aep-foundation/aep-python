@@ -42,9 +42,10 @@ uv run python examples/agent_service.py
 uv run python examples/hosted_platform.py
 ```
 
-The first example composes an Agent, Service, every built-in credential profile, protected resource,
-and the framework-neutral ASGI adapter. The second demonstrates hosted identity Platform discovery,
-Service DID resolution, provisioning, DID publication, delegated signing, and identity listing. See
+The first example composes an Agent, Service, JWT authentication, every built-in credential profile,
+a protected resource, and the framework-neutral ASGI adapter. The second demonstrates Platform
+discovery, Service DID resolution, provisioning, DID publication, verified delegated signing,
+identity listing, and suspension that prevents further signing. See
 [`examples/README.md`](./examples/README.md) for the integration boundaries and production
 replacements.
 
@@ -62,6 +63,50 @@ memory store is intended for examples and local development.
 Concrete Grant Types and extensions can define additional Grant and Revoke request members. Pass
 those members through `GrantOptions.parameters` or `RevokeOptions.parameters`; the Agent retains
 control of the standard Grant Type and Revoke selector fields.
+
+## Protected HTTP requests
+
+After explicitly enrolling an Agent with a Service, use `fetch_protected_resource()` to request a
+protected URL. It returns the SDK's transport-independent `HttpResponse`:
+
+```python
+from agent_enrollment_protocol.agent import (
+    FetchProtectedResourceOptions,
+    fetch_protected_resource,
+)
+from agent_enrollment_protocol.core import HttpRequest
+
+response = await fetch_protected_resource(
+    FetchProtectedResourceOptions(
+        agent=agent,
+        request=HttpRequest(method="GET", url="https://service.example/private"),
+        carrier="AEP-Authorization",
+    )
+)
+```
+
+The helper uses advertised OpenAPI security when it can resolve a complete supported requirement;
+otherwise it waits for a valid `401` AEP challenge. It reuses stored credentials or signs a
+resource-bound assertion, and can request a supported Grant for an already-enrolled identity. It
+does not enroll automatically. Set `grant_type` to select a credential type, or `credential_id` to
+select one stored credential. A missing `credential_id` match fails instead of requesting a
+replacement Grant.
+
+Requests use replayable byte bodies. Redirects are handled manually: each same-origin JWT retry
+gets a fresh assertion bound to its target, and an origin change drops caller headers and requires
+a new anonymous AEP challenge. The defaults are five redirects and thirty seconds for the entire
+operation, including discovery and authentication. Task cancellation propagates to the active
+operation. Responses obey the Agent's `maximum_response_bytes` bound.
+
+Put payment credentials and custom secret headers in `additional_authentication_headers`, not
+`request.headers`. They are sent only on authenticated requests to the original origin. Select
+`carrier="AEP-Authorization"` when payment authentication occupies `Authorization`. Additional
+headers cannot override the selected AEP credential.
+
+An optional `transport` implements `AsyncHttpTransport`; it must return redirects without following
+them. The helper closes its default `HttpxTransport` after the operation but does not close a
+caller-provided transport. Existing `ServiceSession.authentication_headers()` remains available
+for applications that manage their own HTTP requests.
 
 ## Service ASGI integration
 
@@ -96,6 +141,10 @@ principal = principal_from_scope(scope)
 if principal is None:
     raise RuntimeError("The route requires AEP authentication")
 ```
+
+The application then applies its own account permissions and scope checks. Authentication alone
+does not authorize every operation. The complete Service construction, credential issuers and
+example DID verifier are in [`examples/agent_service.py`](./examples/agent_service.py).
 
 Use a separate unprotected application branch for public resources. For local development,
 `allow_insecure_loopback=True` permits an HTTP `localhost` or loopback resource origin; production
@@ -140,6 +189,15 @@ opaque Platform context; returning updated context starts the next signing stage
 idempotency key. Without a resolver, pending signing raises `PlatformSignPendingError` for the
 application to continue explicitly.
 
+Grant recovers an existing identity through `find_identity_by_service_did` when the identity
+provider implements `ExistingIdentityProvider` and the Agent's local identity store is empty.
+Recovery does not provision or enroll an identity. The Agent checks Service Status before
+requesting credentials when the Service advertises Status.
+
+The default HTTP transport requires TLS 1.3 or later and verifies certificates using the system
+trust configuration. Applications supplying an HTTP client or transport control its TLS settings
+and must enforce the same protocol minimum. The SDK does not change a supplied client's settings.
+
 ## Hosted identity Platform
 
 `agent_enrollment_protocol.platform` implements discovery, Service-scoped Agent identity
@@ -181,6 +239,28 @@ Map `platform.discovery()` to `/.well-known/aep-platform` and the remaining meth
 advertised by `DiscoveryOptions`. Authenticate private Platform routes before constructing their
 `RequestContext`; the Platform also invokes the supplied authorizer for every private operation.
 Enable hosted verification only with a replay store.
+
+For hosted verification, the authorizer decides whether the authenticated caller may verify the
+supplied Agent assertion. A trusted Service can call with its own credentials; it does not need
+the identity owner's credentials. Authorize that relationship explicitly rather than permitting
+every authenticated caller to verify every identity. Signing and identity management retain their
+owner checks.
+
+## Application-owned storage
+
+Default memory stores retain state only for the lifetime of one process. To retain an Agent's
+identity and session credentials across restarts, supply `AgentOptions.identity_store` and
+`credential_store`. A Service supplies durable enrollment, credential, replay and idempotency
+stores; a Platform supplies identity, key, idempotency and, when using hosted verification, replay
+storage. Inspect and discovery caches can remain transient.
+
+Custom stores implement the asynchronous interfaces exported by their role module. In particular,
+Service `EnrollmentStore.find_or_create()` must atomically reuse or create one enrollment for an
+Agent DID. Service `IdempotencyStore.execute()` and Platform `PlatformIdempotencyStore.execute()`
+must atomically run or replay an operation and reject conflicting reuse of the key. Retain command
+results for at least one hour. Replay-store `consume()` must atomically refuse a second use of an
+assertion identifier. Independent reads followed by writes do not provide these guarantees when
+requests run concurrently or the application has multiple instances.
 
 ## Development
 

@@ -10,7 +10,13 @@ from typing import Any
 import jwt
 
 from .errors import AepAssertionError
-from .models import AssertionOperation, ClientAssertionClaims, SigningAlgorithm
+from .models import (
+    AssertionOperation,
+    ClientAssertionClaims,
+    SigningAlgorithm,
+    _normalize_resource_uri,
+)
+from .validation import _reject_json_constant
 
 _BASE64URL_PATTERN = re.compile(r"\A[A-Za-z0-9_-]+\Z")
 
@@ -41,7 +47,7 @@ def sign_client_assertion(
     allow_insecure_loopback: bool = False,
 ) -> str:
     claims = ClientAssertionClaims.model_validate_json(
-        json.dumps(claims.to_wire()),
+        json.dumps(claims.to_wire(), allow_nan=False),
         context={"allow_insecure_loopback": allow_insecure_loopback},
     )
     kid = key_id or claims.iss
@@ -60,7 +66,8 @@ def verify_client_assertion(
     options = options or VerifyClientAssertionOptions()
     try:
         header = jwt.get_unverified_header(assertion)
-    except jwt.PyJWTError as error:
+        json.dumps(header, allow_nan=False)
+    except (jwt.PyJWTError, ValueError) as error:
         raise AepAssertionError("Invalid AEP client assertion.") from error
     if header.get("typ") != "JWT" or not isinstance(header.get("kid"), str):
         raise AepAssertionError("Invalid AEP client assertion JOSE header.")
@@ -78,10 +85,11 @@ def verify_client_assertion(
                 "verify_aud": False,
                 "verify_exp": False,
                 "verify_iat": False,
+                "verify_nbf": False,
             },
         )
         claims = ClientAssertionClaims.model_validate_json(
-            json.dumps(payload),
+            json.dumps(payload, allow_nan=False),
             context={"allow_insecure_loopback": options.allow_insecure_loopback},
         )
     except (jwt.PyJWTError, ValueError) as error:
@@ -89,6 +97,14 @@ def verify_client_assertion(
     _require_key_binding(header["kid"], claims)
     now = options.current_time if options.current_time is not None else int(time.time())
     tolerance = options.clock_tolerance_seconds
+    if "nbf" in payload:
+        not_before = payload["nbf"]
+        if (
+            isinstance(not_before, bool)
+            or not isinstance(not_before, (int, float))
+            or not_before > now + tolerance
+        ):
+            raise AepAssertionError("AEP client assertion is not yet valid or has an invalid nbf.")
     if claims.iat > now + tolerance or claims.exp <= now - tolerance:
         raise AepAssertionError("AEP client assertion is outside its valid time window.")
     expected = (
@@ -96,11 +112,21 @@ def verify_client_assertion(
         ("issuer", options.issuer, claims.iss),
         ("subject", options.subject, claims.sub),
         ("operation", options.operation, claims.op),
-        ("resource", options.resource, claims.resource),
     )
     for name, wanted, actual in expected:
         if wanted is not None and wanted != actual:
             raise AepAssertionError(f"AEP client assertion {name} does not match.")
+    if options.resource is not None:
+        try:
+            matches = claims.resource is not None and _normalize_resource_uri(
+                claims.resource, allow_insecure_loopback=options.allow_insecure_loopback
+            ) == _normalize_resource_uri(
+                options.resource, allow_insecure_loopback=options.allow_insecure_loopback
+            )
+        except ValueError as error:
+            raise AepAssertionError("AEP client assertion resource is invalid.") from error
+        if not matches:
+            raise AepAssertionError("AEP client assertion resource does not match.")
     return claims
 
 
@@ -135,7 +161,7 @@ def _decode_part(value: str) -> dict[str, Any]:
             result[key] = item
         return result
 
-    parsed = json.loads(decoded, object_pairs_hook=pairs)
+    parsed = json.loads(decoded, object_pairs_hook=pairs, parse_constant=_reject_json_constant)
     if not isinstance(parsed, dict):
         raise ValueError("JWT part must be an object")
     return parsed

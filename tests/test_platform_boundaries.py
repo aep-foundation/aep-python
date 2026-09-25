@@ -21,9 +21,12 @@ from agent_enrollment_protocol.core import (
     PlatformVerificationResponse,
     ProblemDetails,
     SigningAlgorithm,
+    did_web_document_url,
     sign_client_assertion,
 )
 from agent_enrollment_protocol.platform import (
+    AuthorizationOperation,
+    AuthorizationRequest,
     DidVerificationMethod,
     IdempotentOperation,
     IdentityListQuery,
@@ -38,11 +41,13 @@ from agent_enrollment_protocol.platform import (
     PlatformIdempotencyState,
     PlatformResult,
     RequestContext,
+    SignHandlerInput,
     StoredResponse,
     create_did_document,
     create_service_scoped_agent_did,
 )
 from agent_enrollment_protocol.platform.document import create_discovery_document, render_did_url
+from agent_enrollment_protocol.platform.platform import _lifecycle_error
 from tests.test_platform import (
     NOW,
     SERVICE_DID,
@@ -114,6 +119,45 @@ def test_did_helpers() -> None:
     ):
         with pytest.raises(ValueError, match="does not match"):
             create_did_document(identity, invalid)
+
+
+@pytest.mark.parametrize(
+    "jwk",
+    [
+        {"crv": "P-256", "d": "private", "kty": "EC", "x": "AQ", "y": "AQ"},
+        {"crv": "Ed25519", "d": "private", "kty": "OKP", "x": "AQ"},
+        {"kty": "RSA", "n": "AQ", "e": "AQ", "p": "private"},
+        {"kty": "RSA", "n": "AQ", "e": "AQ", "qi": "private"},
+        {"k": "symmetric", "kty": "oct"},
+    ],
+)
+def test_did_document_refuses_private_key_material(jwk: dict[str, str]) -> None:
+    # PLT-DID-002: the DID document is served to anyone who resolves the Agent DID, so a key store
+    # that returned a JWK still carrying its private members would publish the signing key itself.
+    identity = record()
+    method = DidVerificationMethod(
+        controller=identity.agent_did,
+        id=identity.key_id,
+        public_key_jwk=jwk,
+        type="JsonWebKey2020",
+    )
+    with pytest.raises(ValueError, match="only public key material"):
+        create_did_document(identity, method)
+
+
+@pytest.mark.parametrize(
+    ("status", "code"),
+    [
+        (ManagedAgentStatus.TERMINATED, "identity_terminated"),
+        (ManagedAgentStatus.SUSPENDED, "identity_suspended"),
+        (ManagedAgentStatus.REVOKED, "identity_suspended"),
+        (ManagedAgentStatus.ACTIVE, "identity_unavailable"),
+    ],
+)
+def test_lifecycle_errors_use_registered_codes(status: ManagedAgentStatus, code: str) -> None:
+    # CORE-ERR-009 registers identity_suspended, identity_terminated and identity_unavailable, and
+    # no identity_revoked or identity_active, so a revoked identity reports the suspended code.
+    assert _lifecycle_error(status) == code
 
 
 def test_discovery_boundaries() -> None:
@@ -289,6 +333,147 @@ def test_platform_configuration_boundaries(change: dict[str, Any], message: str)
         Platform(options(**change))
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        "https://other.example/agents/{agent_did_id}/did.json",
+        "https://platform.example/other/{agent_did_id}/did.json",
+        "https://platform.example/agents/{agent_did_id}/key.json",
+    ],
+)
+def test_platform_rejects_did_templates_that_do_not_resolve_the_minted_did(template: str) -> None:
+    with pytest.raises(ValueError, match="must match"):
+        Platform(options(did_url_template=template))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host,prefix", [("platform.example", "a/b"), ("platform.example:8443", "")]
+)
+async def test_custom_did_configuration_matches_ordinary_resolution(host: str, prefix: str) -> None:
+    path = f"{prefix}/" if prefix else ""
+    platform = Platform(
+        options(
+            did_host=host,
+            did_path_prefix=prefix,
+            did_url_template=f"https://{host}/{path}{{agent_did_id}}/did.json",
+        )
+    )
+    identity_id, did = await provisioned(platform)
+    identity = await platform.get_identity(identity_id, context(key=None))
+    assert identity.body is not None
+    assert identity.body.did_document_url == did_web_document_url(did)
+    document = await platform.did_document("agent-one")
+    assert document.body is not None and document.body["id"] == did
+
+
+@pytest.mark.asyncio
+async def test_cached_private_results_reauthorize_without_repeating_operations() -> None:
+    class CountedKeys(KeyStore):
+        def __init__(self) -> None:
+            super().__init__()
+            self.signatures = 0
+
+        async def sign(self, identity: IdentityRecord, claims: ClientAssertionClaims) -> str:
+            self.signatures += 1
+            return await super().sign(identity, claims)
+
+    authorizer = AllowAuthorizer()
+    keys = CountedKeys()
+    current = [NOW]
+    platform = Platform(
+        options(
+            authorizer=authorizer,
+            key_store=keys,
+            clock=lambda: current[0],
+            discovery=replace(options().discovery, hosted_verification_endpoint="/verify"),
+            hosted_verification=True,
+            replay_store=MemoryReplayStore(),
+        )
+    )
+    provision_request = PlatformProvisionRequest(service_did=SERVICE_DID)
+    provision_context = context("provision")
+    provision_result = await platform.provision(provision_request, provision_context)
+    assert provision_result.body is not None
+    identity_id = provision_result.body.agent_identity_id
+    sign_request = PlatformSignRequest(
+        jti="cached", op=AssertionOperation.STATUS, service_did=SERVICE_DID
+    )
+    sign_context = context("sign")
+    sign_result = await platform.sign(identity_id, sign_request, sign_context)
+    assert isinstance(sign_result.body, PlatformSignCompleted)
+    verify_request = PlatformVerificationRequest(
+        client_assertion=sign_result.body.client_assertion,
+        op=AssertionOperation.STATUS,
+        service_did=SERVICE_DID,
+    )
+    verify_context = context("verify")
+    verify_result = await platform.verify(verify_request, verify_context)
+    assert verify_result.body is not None and verify_result.body.verified
+    before = len(authorizer.requests)
+    assert await platform.provision(provision_request, provision_context) == provision_result
+    assert await platform.sign(identity_id, sign_request, sign_context) == sign_result
+    assert await platform.verify(verify_request, verify_context) == verify_result
+    assert len(authorizer.requests) == before + 3
+
+    authorizer.allowed = False
+    before = len(authorizer.requests)
+    assert (await platform.provision(provision_request, provision_context)).status == 404
+    assert (await platform.sign(identity_id, sign_request, sign_context)).status == 404
+    denied = await platform.verify(verify_request, verify_context)
+    assert denied.body is not None
+    assert denied.body.to_wire() == {
+        "reason": "not_recognized",
+        "service_did": SERVICE_DID,
+        "verified": False,
+    }
+    assert len(authorizer.requests) == before + 3
+
+    authorizer.allowed = True
+    current[0] += timedelta(minutes=10)
+    await platform.update_identity(
+        identity_id,
+        PlatformLifecycleRequest(status=ManagedAgentStatus.SUSPENDED),
+        context(key=None),
+    )
+    assert await platform.provision(provision_request, provision_context) == provision_result
+    assert await platform.sign(identity_id, sign_request, sign_context) == sign_result
+    assert await platform.verify(verify_request, verify_context) == verify_result
+    assert keys.signatures == 1 and len(keys.created) == 1
+    fresh = await platform.sign(identity_id, sign_request, context("fresh"))
+    assert fresh.status == 403
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", [{"principal": ""}, {"idempotency_key": None}])
+async def test_private_sign_and_verify_require_authenticated_retry_context(
+    missing: dict[str, Any],
+) -> None:
+    platform = Platform(
+        options(
+            discovery=replace(options().discovery, hosted_verification_endpoint="/verify"),
+            hosted_verification=True,
+            replay_store=MemoryReplayStore(),
+        )
+    )
+    identity_id, _ = await provisioned(platform)
+    caller = replace(context("missing"), **missing)
+    signed = await platform.sign(
+        identity_id,
+        PlatformSignRequest(jti="missing", op=AssertionOperation.STATUS, service_did=SERVICE_DID),
+        caller,
+    )
+    verified = await platform.verify(
+        PlatformVerificationRequest(
+            client_assertion="a.b.c", op=AssertionOperation.STATUS, service_did=SERVICE_DID
+        ),
+        caller,
+    )
+    assert signed.status == verified.status == 400
+    assert signed.problem is not None and signed.problem.code == "invalid_request"
+    assert verified.problem is not None and verified.problem.code == "invalid_request"
+
+
 def test_unsupported_platform_algorithm() -> None:
     with pytest.raises(ValueError, match="not supported"):
         Platform(options(signing_algorithms=(cast(SigningAlgorithm, "RS256"),)))
@@ -405,16 +590,17 @@ async def test_platform_operation_boundaries() -> None:
     assert isinstance(prefixed_result.body, PlatformAgentIdentity)
     assert prefixed_result.body.agent_identity_id == "pai_existing"
 
-    for change in (
-        {"identifier": lambda: ""},
-        {"agent_did_id_generator": lambda: ""},
-        {"clock": lambda: NOW.replace(tzinfo=None)},
-    ):
+    for change in ({"identifier": lambda: ""}, {"agent_did_id_generator": lambda: ""}):
         invalid = Platform(options(**change))
         with pytest.raises(ValueError):
             await invalid.provision(
                 PlatformProvisionRequest(service_did=SERVICE_DID), context("invalid")
             )
+
+    # The Discovery Last-Modified validator is stamped when the document is built, so a clock that
+    # cannot produce one is refused at construction rather than at the first command.
+    with pytest.raises(ValueError, match="offset-aware"):
+        Platform(options(clock=lambda: NOW.replace(tzinfo=None)))
 
     class MismatchedStore(MemoryIdentityStore):
         async def find_or_create(
@@ -492,8 +678,154 @@ async def test_platform_operation_boundaries() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("offset", [-86400, 0, 86400])
+@pytest.mark.parametrize("lowercase", [False, True])
+async def test_custom_signing_timestamps_use_core_parsing_and_the_platform_clock(
+    offset: int, lowercase: bool
+) -> None:
+    keys = KeyStore()
+
+    async def handler(value: SignHandlerInput, caller: RequestContext) -> PlatformResult[Any]:
+        result = await _completed_sign_result(keys, value, NOW + timedelta(seconds=offset))
+        if lowercase:
+            assert result.body is not None
+            return replace(
+                result,
+                body=result.body.model_copy(
+                    update={
+                        "issued_at": result.body.issued_at.lower(),
+                        "expires_at": result.body.expires_at.lower(),
+                    }
+                ),
+            )
+        return result
+
+    platform = Platform(options(key_store=keys, sign_handler=handler))
+    identity_id, _ = await provisioned(platform)
+    request = PlatformSignRequest(
+        jti="custom-time",
+        op=AssertionOperation.STATUS,
+        service_did=SERVICE_DID,
+        lifetime_seconds="30",
+    )
+    if offset:
+        with pytest.raises(ValueError, match="invalid client assertion"):
+            await platform.sign(identity_id, request, context("custom-time"))
+    else:
+        result = await platform.sign(identity_id, request, context("custom-time"))
+        assert result.status == 200 and isinstance(result.body, PlatformSignCompleted)
+        assert result.body.issued_at == (
+            "2026-01-02t03:04:05z" if lowercase else "2026-01-02T03:04:05Z"
+        )
+
+
+async def _completed_sign_result(
+    keys: KeyStore, value: SignHandlerInput, issued: datetime
+) -> PlatformResult[PlatformSignCompleted]:
+    claims = ClientAssertionClaims(
+        aud=SERVICE_DID,
+        exp=int(issued.timestamp()) + 30,
+        iat=int(issued.timestamp()),
+        iss=value.identity.agent_did,
+        sub=value.identity.agent_did,
+        jti=value.request.jti,
+        op=value.request.op,
+    )
+    return PlatformResult(
+        200,
+        PlatformSignCompleted(
+            status="completed",
+            agent_did=value.identity.agent_did,
+            client_assertion=await keys.sign(value.identity, claims),
+            expires_at=(issued + timedelta(seconds=30)).isoformat().replace("+00:00", "Z"),
+            issued_at=issued.isoformat().replace("+00:00", "Z"),
+            jti=value.request.jti,
+            service_did=SERVICE_DID,
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handled", [False, True])
+async def test_signing_uses_the_platform_clock_after_the_custom_handler(handled: bool) -> None:
+    current = [NOW]
+    keys = KeyStore()
+
+    async def handler(
+        value: SignHandlerInput, caller: RequestContext
+    ) -> PlatformResult[PlatformSignCompleted] | None:
+        current[0] += timedelta(seconds=2)
+        return await _completed_sign_result(keys, value, current[0]) if handled else None
+
+    platform = Platform(options(key_store=keys, sign_handler=handler, clock=lambda: current[0]))
+    identity_id, _ = await provisioned(platform)
+    result = await platform.sign(
+        identity_id,
+        PlatformSignRequest(
+            jti="delayed",
+            op=AssertionOperation.STATUS,
+            service_did=SERVICE_DID,
+            lifetime_seconds="30",
+        ),
+        replace(context("delayed"), current_time=None),
+    )
+    assert result.status == 200 and isinstance(result.body, PlatformSignCompleted)
+    assert result.body.issued_at == "2026-01-02T03:04:07Z"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize(
+    "content_type,headers,problem,accepted",
+    [
+        ("application/aep+json", {}, None, True),
+        ("Application/Aep+Json; charset=utf-8", {"X-Request-ID": "one"}, None, True),
+        ("text/plain", {}, None, False),
+        ("application/aep+json", {"rEtRy-AfTeR": "300"}, None, False),
+        (
+            "application/aep+json",
+            {},
+            ProblemDetails(type="urn:aep:error:x", title="x", code="x", status=400),
+            False,
+        ),
+    ],
+)
+async def test_custom_signing_response_metadata_matches_the_protocol(
+    pending: bool,
+    content_type: str,
+    headers: dict[str, str],
+    problem: ProblemDetails | None,
+    accepted: bool,
+) -> None:
+    keys = KeyStore()
+
+    async def handler(value: SignHandlerInput, caller: RequestContext) -> PlatformResult[Any]:
+        result: PlatformResult[Any] = (
+            PlatformResult(202, PlatformSignPending(status="pending", retry_after_seconds="5"))
+            if pending
+            else await _completed_sign_result(keys, value, NOW)
+        )
+        return replace(result, content_type=content_type, headers=headers, problem=problem)
+
+    platform = Platform(options(key_store=keys, sign_handler=handler))
+    identity_id, _ = await provisioned(platform)
+    request = PlatformSignRequest(
+        jti="metadata", op=AssertionOperation.STATUS, service_did=SERVICE_DID, lifetime_seconds="30"
+    )
+    if accepted:
+        result = await platform.sign(identity_id, request, context("metadata"))
+        assert result.status == (202 if pending else 200)
+        assert result.headers == headers and result.content_type == content_type
+        assert await platform.sign(identity_id, request, context("metadata")) == result
+    else:
+        with pytest.raises(ValueError, match="response must"):
+            await platform.sign(identity_id, request, context("metadata"))
+
+
+@pytest.mark.asyncio
 async def test_sign_handler_validation() -> None:
     cases: tuple[PlatformResult[Any], ...] = (
+        PlatformResult(200),
         PlatformResult(
             200,
             PlatformSignPending(status="pending", retry_after_seconds="1"),
@@ -665,6 +997,74 @@ async def test_idempotency_store_must_supply_response() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trusted_service_verification_does_not_grant_identity_management() -> None:
+    class TrustedServiceAuthorizer:
+        async def authorize(self, request: AuthorizationRequest, caller: RequestContext) -> bool:
+            if request.operation is AuthorizationOperation.VERIFY:
+                return caller.principal == "trusted-service"
+            return bool(caller.principal)
+
+    platform = Platform(
+        options(
+            authorizer=TrustedServiceAuthorizer(),
+            discovery=replace(options().discovery, hosted_verification_endpoint="/verify"),
+            hosted_verification=True,
+            replay_store=MemoryReplayStore(),
+        )
+    )
+    identity_id, agent_did = await provisioned(platform)
+    sign_request = PlatformSignRequest(
+        jti="trusted-service", op=AssertionOperation.STATUS, service_did=SERVICE_DID
+    )
+    signed = await platform.sign(identity_id, sign_request, context("sign"))
+    assert isinstance(signed.body, PlatformSignCompleted)
+    request = PlatformVerificationRequest(
+        client_assertion=signed.body.client_assertion,
+        op=AssertionOperation.STATUS,
+        service_did=SERVICE_DID,
+    )
+    denied = await platform.verify(request, context("denied", principal="untrusted-service"))
+    assert denied.body is not None
+    assert denied.body.to_wire() == {
+        "verified": False,
+        "reason": "not_recognized",
+        "service_did": SERVICE_DID,
+    }
+    caller = context("verify", principal="trusted-service")
+    mismatched = await platform.verify(
+        request.model_copy(update={"service_did": "did:web:other.example"}), caller
+    )
+    assert mismatched.body is not None and not mismatched.body.verified
+    verified = await platform.verify(request, replace(caller, idempotency_key="valid"))
+    assert verified.body is not None and verified.body.verified
+    assert verified.body.agent_did == agent_did
+    assert verified.body.agent_identity_id == identity_id
+    replayed = await platform.verify(request, replace(caller, idempotency_key="replay"))
+    assert replayed.body is not None and not replayed.body.verified
+    anonymous = await platform.verify(request, replace(caller, principal=""))
+    assert anonymous.status == 400
+
+    assert (await platform.get_identity(identity_id, caller)).status == 404
+    listed = await platform.list(IdentityListQuery(), caller)
+    assert listed.status == 200
+    assert listed.body is not None and listed.body.count == "0" and listed.body.total == "0"
+    assert (
+        await platform.sign(
+            identity_id, sign_request, replace(caller, idempotency_key="cannot-sign")
+        )
+    ).status == 404
+    assert (
+        await platform.update_identity(
+            identity_id,
+            PlatformLifecycleRequest(status=ManagedAgentStatus.SUSPENDED),
+            caller,
+        )
+    ).status == 404
+    identity = await platform.get_identity(identity_id, context(key=None))
+    assert identity.body is not None and identity.body.status is ManagedAgentStatus.ACTIVE
+
+
+@pytest.mark.asyncio
 async def test_hosted_verification_rejects_unrecognized_assertions() -> None:
     keys = KeyStore()
     discovery = replace(options().discovery, hosted_verification_endpoint="/verify")
@@ -686,6 +1086,7 @@ async def test_hosted_verification_rejects_unrecognized_assertions() -> None:
     )
     assert isinstance(signed.body, PlatformSignCompleted)
     assertion = signed.body.client_assertion
+    authorizer.allowed = False
     wrong_principal = await platform.verify(
         PlatformVerificationRequest(
             client_assertion=assertion, op=AssertionOperation.STATUS, service_did=SERVICE_DID
@@ -694,7 +1095,6 @@ async def test_hosted_verification_rejects_unrecognized_assertions() -> None:
     )
     assert isinstance(wrong_principal.body, PlatformVerificationResponse)
     assert wrong_principal.body.verified is False
-    authorizer.allowed = False
     denied = await platform.verify(
         PlatformVerificationRequest(
             client_assertion=assertion, op=AssertionOperation.STATUS, service_did=SERVICE_DID

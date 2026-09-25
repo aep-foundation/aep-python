@@ -56,6 +56,8 @@ from agent_enrollment_protocol.core.errors import (
     AepAuthorizationError,
     AepValidationError,
 )
+from agent_enrollment_protocol.core.models import _normalize_resource_uri
+from agent_enrollment_protocol.core.validation import _reject_duplicate_members
 
 from .stores import (
     MemoryEnrollmentStore,
@@ -363,7 +365,10 @@ class Service:
     async def authenticate_protected_resource(
         self, request: ProtectedResourceRequest
     ) -> ProtectedResourceResult:
-        resource = _absolute_url(request.url, self._allow_insecure_loopback)
+        resource = _normalize_resource_uri(
+            _absolute_url(request.url, self._allow_insecure_loopback),
+            allow_insecure_loopback=self._allow_insecure_loopback,
+        )
         headers = _normalize_headers(request.headers)
         presentation, unambiguous = _select_presentation(headers)
         if not unambiguous:
@@ -481,6 +486,13 @@ class Service:
                 json.dumps(claims.to_wire()),
                 context={"allow_insecure_loopback": self._allow_insecure_loopback},
             )
+            claimed_resource = (
+                _normalize_resource_uri(
+                    claims.resource, allow_insecure_loopback=self._allow_insecure_loopback
+                )
+                if claims.resource is not None
+                else None
+            )
         except ValueError:
             return False
         key_id = header.get("kid")
@@ -493,7 +505,7 @@ class Service:
             or claims.aud != self._document.service.did
             or claims.iss != claims.sub
             or claims.op is not operation
-            or claims.resource != resource
+            or claimed_resource != resource
             or _identity_method(claims.sub) not in self._document.identity.methods
         ):
             return False
@@ -600,10 +612,7 @@ def _model_parser(model: type[ModelT]) -> Callable[[bytes], ModelT]:
 
 
 def _parse_object(body: bytes) -> dict[str, Any]:
-    value = json.loads(body)
-    if not isinstance(value, dict):
-        raise ValueError("AEP Grant response must be a JSON object")
-    return cast(dict[str, Any], value)
+    return _credential_object(body)
 
 
 def _problem(
@@ -714,14 +723,13 @@ def _within_structure(
 
 def _credential_object(raw: bytes) -> dict[str, Any]:
     try:
-        value = json.loads(raw)
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError("AEP Grant response must be a JSON object") from error
-    if (
-        not isinstance(value, dict)
-        or not isinstance(value.get("credential_id"), str)
-        or not value["credential_id"]
-    ):
+        _reject_duplicate_members(raw, "Grant response")
+    except AepValidationError as error:
+        raise ValueError("AEP Grant response must be valid JSON") from error
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError("AEP Grant response must be a JSON object")
+    if not isinstance(value.get("credential_id"), str) or not value["credential_id"]:
         raise ValueError("AEP Grant response requires a stable credential_id")
     return value
 
@@ -750,6 +758,11 @@ def _select_presentation(
         if any(_recognized(value) for value in standard):
             return None, False
         return selected, True
+    # CORE-PR-038 separates a missing credential from a malformed one. An Authorization value
+    # naming an AEP scheme is an AEP presentation even when the rest of it does not parse, so it
+    # fails closed here; values belonging to other protocols stay available to them.
+    if any(_names_aep_scheme(value) and not _recognized(value) for value in standard):
+        return None, False
     recognized = [value for value in standard if _recognized(value)]
     if len(recognized) > 1 or (recognized and len(standard) > 1):
         return None, False
@@ -764,6 +777,11 @@ def _recognized(value: str) -> bool:
         return True
     except AepAuthorizationError:
         return False
+
+
+def _names_aep_scheme(value: str) -> bool:
+    scheme = value.split(" ", 1)[0].split("\t", 1)[0]
+    return scheme.lower() in {item.value.lower() for item in AuthorizationScheme}
 
 
 def _absolute_url(value: str | None, allow_insecure_loopback: bool) -> str:
@@ -854,7 +872,7 @@ def _accepted_claims(
         else ()
     )
     accepted = {name: value for name, value in values.to_wire().items() if name in names}
-    return ClaimValues.model_validate(accepted)
+    return parse_json_model(json.dumps(accepted), ClaimValues, "accepted claims")
 
 
 def _validate_enrollment_record(record: EnrollmentRecord, agent_did: str) -> None:

@@ -551,6 +551,71 @@ async def test_invalid_grant_payloads_and_stored_responses() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"credential_id":"one","opaque":NaN}',
+        b'{"credential_id":"one","opaque":Infinity}',
+        b'{"credential_id":"one","credential_id":"two"}',
+        b'{"credential_id":"one","opaque":{"same":1,"same":2}}',
+    ],
+)
+async def test_grant_rejects_invalid_json_and_allows_a_corrected_retry(raw: bytes) -> None:
+    handler = GrantHandler()
+    handler.response = raw
+    store = MemoryEnrollmentStore()
+    await store.save(_record())
+    service, _ = _service(
+        enrollment_store=store, grant_types=(GrantTypeDefinition("future", handler),)
+    )
+    with pytest.raises(ValueError, match="valid JSON"):
+        await service.grant(
+            b'{"grant_type":"future"}',
+            _options(AssertionOperation.GRANT, "invalid-json", key="same"),
+        )
+    handler.response = b'{"credential_id":"one","opaque":{"value":"secret"}}'
+    corrected = await service.grant(
+        b'{"grant_type":"future"}', _options(AssertionOperation.GRANT, "corrected-json", key="same")
+    )
+    assert corrected.status == 200
+    assert corrected.body == {"credential_id": "one", "opaque": {"value": "secret"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"credential_id":"one","opaque":NaN}',
+        b'{"credential_id":"one","credential_id":"two"}',
+        b'{"opaque":"secret"}',
+    ],
+)
+async def test_cached_grant_response_uses_the_same_json_validation(raw: bytes) -> None:
+    class InvalidIdempotencyStore:
+        async def execute(
+            self,
+            value: IdempotencyInput,
+            operation: Callable[[], Awaitable[StoredResponse]],
+        ) -> IdempotencyResult:
+            return IdempotencyResult(
+                StoredResponse(raw, "application/aep+json", NOW, {}, 200),
+                IdempotencyState.REPLAYED,
+            )
+
+    store = MemoryEnrollmentStore()
+    await store.save(_record())
+    service, _ = _service(
+        enrollment_store=store,
+        grant_types=(GrantTypeDefinition("future", GrantHandler()),),
+        idempotency_store=InvalidIdempotencyStore(),
+    )
+    with pytest.raises(ValueError, match=r"valid JSON|stable credential_id"):
+        await service.grant(
+            b'{"grant_type":"future"}', _options(AssertionOperation.GRANT, "cached", key="cached")
+        )
+
+
+@pytest.mark.asyncio
 async def test_claim_structure_limits() -> None:
     cases = (
         (ClaimValueLimits(maximum_string_length=2), {"custom": "long"}),

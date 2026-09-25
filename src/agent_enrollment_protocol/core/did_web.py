@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 _INVALID_PERCENT_ENCODING = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_VISIBLE_ASCII_PATTERN = re.compile(r"\A[\x21-\x7e]+\Z")
 
 
 def did_web_document_url(did: str, *, allow_insecure_loopback: bool = False) -> str:
@@ -53,7 +54,11 @@ def _did_web_parts(did: str) -> tuple[str, tuple[str, ...]]:
     ):
         raise ValueError(f"Invalid did:web identifier: {did}")
     host = unquote(encoded_parts[0])
-    if not host.isascii():
+    # urlsplit strips CR, LF, and tab before parsing, so a host carrying one would be inspected in
+    # its sanitized form and then concatenated into the document URL in its raw form. Requiring
+    # visible US-ASCII here keeps the value that is validated and the value that is used identical,
+    # and keeps whitespace and control characters out of a URL handed to an HTTP client.
+    if not host.isascii() or not _VISIBLE_ASCII_PATTERN.fullmatch(host):
         raise ValueError(f"Invalid did:web identifier: {did}")
     parsed = urlsplit(f"//{host}")
     try:

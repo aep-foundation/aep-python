@@ -98,4 +98,7 @@ def _copy_cache_entry(entry: InspectCacheEntry) -> InspectCacheEntry:
         cache_control=entry.cache_control,
         etag=entry.etag,
         last_modified=entry.last_modified,
+        age=entry.age,
+        date=entry.date,
+        expires=entry.expires,
     )

@@ -120,7 +120,14 @@ from .models import (
     SigningAlgorithm,
     StatusResponse,
 )
-from .openapi import OpenApiPathMatch, match_openapi_path, resolve_openapi_url
+from .openapi import (
+    OpenApiPathMatch,
+    OpenApiSecurityDisposition,
+    OpenApiSecurityResolution,
+    match_openapi_path,
+    resolve_openapi_security,
+    resolve_openapi_url,
+)
 from .validation import (
     ValidationResult,
     parse_json_model,
@@ -195,6 +202,8 @@ __all__ = [
     "OpenApiPathMatch",
     "OpenApiPathMatching",
     "OpenApiReference",
+    "OpenApiSecurityDisposition",
+    "OpenApiSecurityResolution",
     "OpenApiTrailingSlash",
     "PlatformAgentIdentity",
     "PlatformAgentIdentityListResponse",
@@ -241,6 +250,7 @@ __all__ = [
     "parse_platform_sign_response",
     "render_authorization",
     "require_service_origin_binding",
+    "resolve_openapi_security",
     "resolve_openapi_url",
     "same_origin",
     "select_did_web_public_jwk",

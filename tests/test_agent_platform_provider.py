@@ -9,6 +9,7 @@ from typing import cast
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import ec
 
 from agent_enrollment_protocol.agent import (
     MemoryPlatformDiscoveryCache,
@@ -44,6 +45,8 @@ from agent_enrollment_protocol.core import (
     InspectDocument,
     PlatformDiscoveryDocument,
     SigningAlgorithm,
+    decode_jwt_unverified,
+    sign_client_assertion,
 )
 
 from .test_core_models import inspect_document
@@ -51,6 +54,7 @@ from .test_core_models import inspect_document
 NOW = datetime(2026, 9, 3, 12, tzinfo=UTC)
 SERVICE_DID = "did:web:api.example.com"
 AGENT_DID = "did:web:platform.example:agents:one"
+SIGNING_KEY = ec.generate_private_key(ec.SECP256R1())
 
 
 class QueueTransport:
@@ -196,7 +200,9 @@ def claims(**changes: object) -> ClientAssertionClaims:
 def completed(**changes: object) -> dict[str, object]:
     value: dict[str, object] = {
         "agent_did": AGENT_DID,
-        "client_assertion": "header.payload.signature",
+        "client_assertion": sign_client_assertion(
+            claims(), key=SIGNING_KEY, algorithm=SigningAlgorithm.ES256
+        ),
         "expires_at": "2026-09-03T12:02:00Z",
         "issued_at": "2026-09-03T12:00:00Z",
         "jti": "assertion-one",
@@ -205,6 +211,90 @@ def completed(**changes: object) -> dict[str, object]:
     }
     value.update(changes)
     return value
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"client_assertion": "header.payload.signature"},
+        {"issued_at": "2026-09-03T12:00:01Z"},
+        {"expires_at": "2026-09-03T12:02:01Z"},
+        {"agent_did": "did:web:other.example"},
+        {"service_did": "did:web:other.example"},
+    ],
+)
+async def test_completed_response_must_describe_its_actual_assertion(
+    changes: dict[str, object],
+) -> None:
+    instance = provider(
+        QueueTransport(json_response(discovery()), json_response(completed(**changes)))
+    )
+    signer = await instance.signer_for(service_identity())
+    with pytest.raises(ValueError, match=r"assertion|completed Sign"):
+        await signer(claims(), (SigningAlgorithm.ES256,))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"iss": "did:web:other.example", "sub": "did:web:other.example"},
+        {"aud": "did:web:other.example"},
+        {"jti": "another-request"},
+        {"op": AssertionOperation.STATUS},
+        {"iat": int(NOW.timestamp()) + 1, "exp": int(NOW.timestamp()) + 121},
+        {"iat": int(NOW.timestamp()) - 120, "exp": int(NOW.timestamp())},
+        {"exp": int(NOW.timestamp()) + 121},
+    ],
+)
+async def test_delegated_assertion_preserves_request_binding(changes: dict[str, object]) -> None:
+    token = sign_client_assertion(
+        claims(**changes), key=SIGNING_KEY, algorithm=SigningAlgorithm.ES256
+    )
+    instance = provider(
+        QueueTransport(json_response(discovery()), json_response(completed(client_assertion=token)))
+    )
+    signer = await instance.signer_for(service_identity())
+    with pytest.raises(ValueError, match="does not match"):
+        await signer(claims(), (SigningAlgorithm.ES256,))
+
+
+@pytest.mark.asyncio
+async def test_completed_sign_accepts_lowercase_rfc3339_metadata() -> None:
+    instance = provider(
+        QueueTransport(
+            json_response(discovery()),
+            json_response(
+                completed(issued_at="2026-09-03t12:00:00z", expires_at="2026-09-03t12:02:00z")
+            ),
+        )
+    )
+    signer = await instance.signer_for(service_identity())
+    assert (
+        decode_jwt_unverified(await signer(claims(), (SigningAlgorithm.ES256,)))[1]
+        == claims().to_wire()
+    )
+
+
+@pytest.mark.asyncio
+async def test_delegated_signing_allows_a_current_assertion_from_a_slower_platform_clock() -> None:
+    signed_claims = claims(iat=int(NOW.timestamp()) - 2, exp=int(NOW.timestamp()) + 118)
+    token = sign_client_assertion(signed_claims, key=SIGNING_KEY, algorithm=SigningAlgorithm.ES256)
+    instance = provider(
+        QueueTransport(
+            json_response(discovery()),
+            json_response(
+                completed(
+                    client_assertion=token,
+                    issued_at="2026-09-03T11:59:58Z",
+                    expires_at="2026-09-03T12:01:58Z",
+                )
+            ),
+        )
+    )
+    signer = await instance.signer_for(service_identity())
+    assert await signer(claims(), (SigningAlgorithm.ES256,)) == token
 
 
 def provider(
@@ -400,7 +490,8 @@ async def test_delegates_completed_signing_with_context() -> None:
     transport = QueueTransport(json_response(discovery()), json_response(completed()))
     instance = provider(transport, platform_context=context_provider)
     signer = await instance.signer_for(service_identity())
-    assert await signer(claims(), (SigningAlgorithm.ES256,)) == "header.payload.signature"
+    assertion = await signer(claims(), (SigningAlgorithm.ES256,))
+    assert decode_jwt_unverified(assertion)[1] == claims().to_wire()
     outbound = transport.requests[1]
     assert outbound.url.endswith("/v1/aep/agent-identities/pai_one/sign")
     assert outbound.headers["Idempotency-Key"]
@@ -454,7 +545,8 @@ async def test_pending_signing_exposes_or_resolves_opaque_context() -> None:
         pending_sign_resolver=resolver,
     )
     signer = await instance.signer_for(service_identity())
-    assert await signer(claims(), (SigningAlgorithm.ES256,)) == "header.payload.signature"
+    assertion = await signer(claims(), (SigningAlgorithm.ES256,))
+    assert decode_jwt_unverified(assertion)[1] == claims().to_wire()
     assert len(resolved) == 1
     assert transport.requests[1].headers["Idempotency-Key"] == "initial"
     assert transport.requests[2].headers["Idempotency-Key"] == "final"
@@ -535,13 +627,22 @@ async def test_sign_response_contract_boundaries(
 
 @pytest.mark.asyncio
 async def test_authenticate_signing_includes_resource() -> None:
-    transport = QueueTransport(json_response(discovery()), json_response(completed()))
-    instance = provider(transport)
-    signer = await instance.signer_for(service_identity())
     authentication = claims(
         op=AssertionOperation.AUTHENTICATE,
         resource="https://api.example.com/orders",
     )
+    transport = QueueTransport(
+        json_response(discovery()),
+        json_response(
+            completed(
+                client_assertion=sign_client_assertion(
+                    authentication, key=SIGNING_KEY, algorithm=SigningAlgorithm.ES256
+                )
+            )
+        ),
+    )
+    instance = provider(transport)
+    signer = await instance.signer_for(service_identity())
     await signer(authentication, (SigningAlgorithm.ES256,))
     assert json.loads(transport.requests[1].body or b"")["resource"] == (
         "https://api.example.com/orders"
