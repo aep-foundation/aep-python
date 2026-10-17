@@ -230,6 +230,77 @@ def api_document(**changes: object) -> dict[str, object]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", ["updated", "unchanged", "failed", "cancelled", "wrong-did", "unrelated", "denied"]
+)
+async def test_public_openapi_contradiction_revalidates_once(outcome: str) -> None:
+    configuration = openapi_configuration(api_document(security=[]))
+    initial = configuration.agent._inspect_transport
+    assert isinstance(initial, QueueTransport)
+
+    class RefreshTransport(QueueTransport):
+        async def send(self, request: HttpRequest) -> HttpResponse:
+            if request.url.endswith("/openapi.json") and not self.responses:
+                self.requests.append(request)
+                if outcome == "cancelled":
+                    raise asyncio.CancelledError
+                if outcome == "failed":
+                    raise OSError("offline")
+                return HttpResponse(
+                    status=200,
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps(
+                        api_document() if outcome == "updated" else api_document(security=[])
+                    ).encode(),
+                )
+            return await super().send(request)
+
+    metadata = RefreshTransport(*initial.responses)
+    configuration.agent._inspect_transport = metadata
+    transport = QueueTransport(
+        challenge(did="did:web:wrong.example")
+        if outcome == "wrong-did"
+        else HttpResponse(status=401)
+        if outcome == "unrelated"
+        else challenge(),
+        challenge() if outcome == "denied" else HttpResponse(status=200),
+    )
+    configuration = replace(
+        configuration,
+        transport=transport,
+        request=HttpRequest(
+            method="GET",
+            url=URL,
+            headers={"Authorization": "Bearer secret", "Cookie": "secret", "X-Caller": "private"},
+        ),
+    )
+    if outcome == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await fetch_protected_resource(configuration)
+    elif outcome == "wrong-did":
+        with pytest.raises(ValueError, match="did not match"):
+            await fetch_protected_resource(configuration)
+    else:
+        assert (await fetch_protected_resource(configuration)).status == (
+            401 if outcome in {"unrelated", "denied"} else 200
+        )
+    documents = [request for request in metadata.requests if request.url.endswith("/openapi.json")]
+    assert len(documents) == (1 if outcome in {"wrong-did", "unrelated"} else 2)
+    assert all(
+        dict(request.headers)
+        == {"Accept": "application/vnd.oai.openapi+json;version=3.1, application/json"}
+        for request in documents
+    )
+    assert len(transport.requests) == (
+        1 if outcome in {"cancelled", "wrong-did", "unrelated"} else 2
+    )
+    assert "Authorization" not in transport.requests[0].headers
+    assert "Cookie" not in transport.requests[0].headers
+    if len(transport.requests) == 2:
+        assert transport.requests[1].headers["Authorization"].startswith("AEP ")
+
+
+@pytest.mark.asyncio
 async def test_definitive_openapi_security_can_authenticate_without_probe() -> None:
     configuration = openapi_configuration(api_document())
     assert (await fetch_protected_resource(configuration)).status == 200

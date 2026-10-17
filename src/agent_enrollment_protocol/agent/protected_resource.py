@@ -4,6 +4,7 @@ import asyncio
 import math
 import re
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import cast
@@ -121,8 +122,8 @@ async def _fetch(
             # OpenAPI is advisory. A live challenge remains authoritative when discovery fails.
             methods = None
         anonymous: HttpResponse | None = None
-        policy_used = methods is not None
-        if methods is None or require_challenge:
+        policy_used = bool(methods)
+        if not methods or require_challenge:
             anonymous = await _send(
                 transport,
                 agent._maximum_response_bytes,
@@ -146,7 +147,13 @@ async def _fetch(
                 inspection = await session.inspect()
                 if inspection.document.service.did != service_did:
                     raise ValueError("AEP challenge Service DID did not match Inspect")
-                if methods is None:
+                if methods == ():
+                    # Document refresh failure does not override the validated live challenge.
+                    with suppress(
+                        ValueError, OSError, httpx.HTTPError, TimeoutError, AgentCommandError
+                    ):
+                        await _openapi_methods(inspection, request.method, target, agent)
+                if not methods:
                     methods = (
                         inspection.document.authentication.methods
                         if inspection.document.authentication
@@ -381,6 +388,11 @@ async def _openapi_methods(
     resolution = resolve_openapi_security(
         root=root, operation=selected, supported_schemes=supported
     )
+    if resolution.disposition in {
+        OpenApiSecurityDisposition.PUBLIC,
+        OpenApiSecurityDisposition.OPTIONAL_ANONYMOUS,
+    }:
+        return ()
     if resolution.disposition not in {
         OpenApiSecurityDisposition.REQUIRED,
         OpenApiSecurityDisposition.ALTERNATIVES,
