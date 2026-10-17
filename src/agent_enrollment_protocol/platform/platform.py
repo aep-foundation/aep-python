@@ -6,6 +6,7 @@ import secrets
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from email.utils import format_datetime
 from typing import Any, TypeVar, cast
 
 from pydantic import BaseModel
@@ -31,9 +32,12 @@ from agent_enrollment_protocol.core import (
     SigningAlgorithm,
     VerifyClientAssertionOptions,
     decode_jwt_unverified,
+    did_web_document_url,
+    media_type_essence,
     verify_client_assertion,
 )
 from agent_enrollment_protocol.core.errors import AepAssertionError
+from agent_enrollment_protocol.core.models import parse_rfc3339
 
 from .document import (
     DID_MEDIA_TYPE,
@@ -69,6 +73,7 @@ from .types import (
 
 BodyT = TypeVar("BodyT")
 ModelT = TypeVar("ModelT", bound=BaseModel)
+_MISSING_REQUEST_CONTEXT = "Idempotency-Key and authenticated principal are required"
 
 
 class Platform:
@@ -96,7 +101,15 @@ class Platform:
             raise ValueError("AEP Platform assertion lifetime exceeds the configured maximum")
         if options.hosted_verification and options.replay_store is None:
             raise ValueError("AEP Platform hosted verification requires a replay store")
-        create_service_scoped_agent_did(options.did_host, options.did_path_prefix, "validation")
+        sample_did = create_service_scoped_agent_did(
+            options.did_host, options.did_path_prefix, "validation"
+        )
+        if render_did_url(options.did_url_template, "validation") != did_web_document_url(
+            sample_did
+        ):
+            raise ValueError(
+                "AEP Platform DID URL template must match its DID host and path prefix"
+            )
         self._discovery = create_discovery_document(
             options.discovery,
             did_url_template=options.did_url_template,
@@ -124,9 +137,24 @@ class Platform:
         self._service_did_resolver = options.service_did_resolver
         self._sign_handler = options.sign_handler
         self._signing_algorithms = options.signing_algorithms
+        published = json.dumps(
+            self._discovery.to_wire(), sort_keys=True, separators=(",", ":")
+        ).encode()
+        self._discovery_etag = f'"{hashlib.sha256(published).hexdigest()[:32]}"'
+        self._discovery_last_modified = _http_date(_aware(self._clock()))
 
     def discovery(self) -> PlatformResult[PlatformDiscoveryDocument]:
-        return _success(200, self._discovery, {"Cache-Control": "max-age=300"})
+        # PLT-DISC-012: an Agent honouring PLT-DISC-013 revalidates with If-None-Match and
+        # If-Modified-Since, which needs the Platform to publish validators alongside freshness.
+        return _success(
+            200,
+            self._discovery,
+            {
+                "Cache-Control": "max-age=300",
+                "ETag": self._discovery_etag,
+                "Last-Modified": self._discovery_last_modified,
+            },
+        )
 
     async def did_document(self, agent_did_id: str) -> PlatformResult[dict[str, Any]]:
         identity = await self._identity_store.find_by_agent_did_id(agent_did_id)
@@ -188,6 +216,16 @@ class Platform:
     async def provision(
         self, request: PlatformProvisionRequest, context: RequestContext
     ) -> PlatformResult[PlatformAgentIdentity]:
+        if not context.principal or not context.idempotency_key:
+            return _problem(400, "invalid_request", _MISSING_REQUEST_CONTEXT)
+        authorized = await self._authorizer.authorize(
+            AuthorizationRequest(
+                operation=AuthorizationOperation.PROVISION, provision_request=request
+            ),
+            context,
+        )
+        if not authorized:
+            return _problem(404, "not_recognized", "Identity not recognized")
         return await self._idempotent(
             IdempotentOperation.PROVISION,
             request,
@@ -199,14 +237,6 @@ class Platform:
     async def _provision(
         self, request: PlatformProvisionRequest, context: RequestContext
     ) -> PlatformResult[PlatformAgentIdentity]:
-        authorized = await self._authorizer.authorize(
-            AuthorizationRequest(
-                operation=AuthorizationOperation.PROVISION, provision_request=request
-            ),
-            context,
-        )
-        if not authorized:
-            return _problem(404, "not_recognized", "Identity not recognized")
         if not await self._service_did_resolver.resolve(request.service_did):
             return _problem(400, "invalid_request", "Service DID could not be resolved")
         identity, _ = await self._identity_store.find_or_create(
@@ -226,22 +256,15 @@ class Platform:
         context: RequestContext,
     ) -> PlatformResult[PlatformSignResponse]:
         lifetime = self._sign_lifetime(request)
-        material = {"agent_identity_id": agent_identity_id, "request": request.to_wire()}
-        return await self._idempotent(
-            IdempotentOperation.SIGN,
-            material,
-            context,
-            PlatformSignCompleted | PlatformSignPending,
-            lambda: self._sign(agent_identity_id, request, context, lifetime),
-        )
-
-    async def _sign(
-        self,
-        agent_identity_id: str,
-        request: PlatformSignRequest,
-        context: RequestContext,
-        lifetime: int,
-    ) -> PlatformResult[PlatformSignResponse]:
+        if lifetime is None:
+            # PLT-SIGN-011 lets a Platform enforce a shorter local maximum. A caller-supplied value
+            # above it is a rejected request, answered ahead of the idempotency store so an invalid
+            # request neither consumes a key nor escapes as an unhandled failure.
+            return _problem(
+                400, "invalid_request", "lifetime_seconds exceeds the configured maximum"
+            )
+        if not context.principal or not context.idempotency_key:
+            return _problem(400, "invalid_request", _MISSING_REQUEST_CONTEXT)
         identity = await self._authorized_identity(
             agent_identity_id,
             AuthorizationRequest(
@@ -252,6 +275,22 @@ class Platform:
         )
         if identity is None or identity.service_did != request.service_did:
             return _problem(404, "not_recognized", "Identity not recognized")
+        material = {"agent_identity_id": agent_identity_id, "request": request.to_wire()}
+        return await self._idempotent(
+            IdempotentOperation.SIGN,
+            material,
+            context,
+            PlatformSignCompleted | PlatformSignPending,
+            lambda: self._sign(identity, request, context, lifetime),
+        )
+
+    async def _sign(
+        self,
+        identity: IdentityRecord,
+        request: PlatformSignRequest,
+        context: RequestContext,
+        lifetime: int,
+    ) -> PlatformResult[PlatformSignResponse]:
         if (
             identity.status is not ManagedAgentStatus.ACTIVE
             or not await self._lifecycle_policy.can_sign(identity, context)
@@ -262,7 +301,14 @@ class Platform:
                 SignHandlerInput(identity, _clone_model(request)), context
             )
             if handled is not None:
-                await _validate_sign_result(handled, identity, request, lifetime, self._key_store)
+                await _validate_sign_result(
+                    handled,
+                    identity,
+                    request,
+                    lifetime,
+                    self._key_store,
+                    _aware(self._request_time(context)),
+                )
                 return handled
         now = _aware(self._request_time(context))
         claim_data: dict[str, Any] = {
@@ -291,7 +337,7 @@ class Platform:
             response_data["platform_context"] = request.platform_context
         body = PlatformSignCompleted.model_validate(response_data)
         await _validate_sign_result(
-            _success(200, body), identity, request, lifetime, self._key_store
+            _success(200, body), identity, request, lifetime, self._key_store, now
         )
         return _success(200, body)
 
@@ -328,17 +374,8 @@ class Platform:
     ) -> PlatformResult[PlatformVerificationResponse]:
         if not self._hosted_verification:
             return _problem(404, "not_recognized", "Hosted verification is not available")
-        return await self._idempotent(
-            IdempotentOperation.HOSTED_VERIFICATION,
-            request,
-            context,
-            PlatformVerificationResponse,
-            lambda: self._verify(request, context),
-        )
-
-    async def _verify(
-        self, request: PlatformVerificationRequest, context: RequestContext
-    ) -> PlatformResult[PlatformVerificationResponse]:
+        if not context.principal or not context.idempotency_key:
+            return _problem(400, "invalid_request", _MISSING_REQUEST_CONTEXT)
         unrecognized = _success(
             200,
             PlatformVerificationResponse(
@@ -361,12 +398,9 @@ class Platform:
             validate_identity_record(identity)
             if identity.agent_did != agent_did:
                 raise ValueError("AEP Platform identity store returned a mismatched record")
-        if (
-            identity is None
-            or identity.service_did != request.service_did
-            or identity.principal != context.principal
-        ):
+        if identity is None or identity.service_did != request.service_did:
             return unrecognized
+        # A trusted Service verifies with its own credentials, not the identity owner's.
         authorized = await self._authorizer.authorize(
             AuthorizationRequest(
                 operation=AuthorizationOperation.VERIFY,
@@ -375,9 +409,30 @@ class Platform:
             ),
             context,
         )
+        if not authorized:
+            return unrecognized
+        return await self._idempotent(
+            IdempotentOperation.HOSTED_VERIFICATION,
+            request,
+            context,
+            PlatformVerificationResponse,
+            lambda: self._verify(identity, request, context),
+        )
+
+    async def _verify(
+        self,
+        identity: IdentityRecord,
+        request: PlatformVerificationRequest,
+        context: RequestContext,
+    ) -> PlatformResult[PlatformVerificationResponse]:
+        unrecognized = _success(
+            200,
+            PlatformVerificationResponse(
+                reason="not_recognized", service_did=request.service_did, verified=False
+            ),
+        )
         if (
-            not authorized
-            or identity.status is not ManagedAgentStatus.ACTIVE
+            identity.status is not ManagedAgentStatus.ACTIVE
             or not await self._lifecycle_policy.can_verify(identity, context)
         ):
             return unrecognized
@@ -468,15 +523,13 @@ class Platform:
             return None
         return identity
 
-    def _sign_lifetime(self, request: PlatformSignRequest) -> int:
+    def _sign_lifetime(self, request: PlatformSignRequest) -> int | None:
         lifetime = (
             self._default_lifetime
             if request.lifetime_seconds is None
             else int(request.lifetime_seconds)
         )
-        if lifetime > self._maximum_lifetime:
-            raise ValueError("lifetime_seconds exceeds the configured maximum")
-        return lifetime
+        return None if lifetime > self._maximum_lifetime else lifetime
 
     def _request_time(self, context: RequestContext) -> datetime:
         return context.current_time or self._clock()
@@ -489,12 +542,6 @@ class Platform:
         model: Any,
         execute: Callable[[], Awaitable[PlatformResult[BodyT]]],
     ) -> PlatformResult[BodyT]:
-        if not context.principal or not context.idempotency_key:
-            return _problem(
-                400,
-                "invalid_request",
-                "Idempotency-Key and authenticated principal are required",
-            )
         wire = (
             material.model_dump(by_alias=True, exclude_unset=True, mode="json")
             if isinstance(material, BaseModel)
@@ -503,7 +550,8 @@ class Platform:
         encoded = json.dumps(wire, sort_keys=True, separators=(",", ":")).encode()
         result = await self._idempotency_store.execute(
             PlatformIdempotencyInput(
-                idempotency_key=context.idempotency_key,
+                # Private entry points require the authenticated principal and key before lookup.
+                idempotency_key=cast(str, context.idempotency_key),
                 operation=operation,
                 principal=context.principal,
                 request_hash=hashlib.sha256(encoded).hexdigest(),
@@ -575,7 +623,12 @@ async def _validate_sign_result(
     request: PlatformSignRequest,
     requested_lifetime: int,
     key_store: KeyStore,
+    current_time: datetime,
 ) -> None:
+    if media_type_essence(result.content_type) != AEP_MEDIA_TYPE or result.problem is not None:
+        raise ValueError("AEP Platform signing response must use application/aep+json")
+    if any(name.lower() == "retry-after" for name in result.headers):
+        raise ValueError("AEP Platform signing response must not include Retry-After")
     body = result.body
     if isinstance(body, PlatformSignPending):
         if result.status != 202:
@@ -583,8 +636,8 @@ async def _validate_sign_result(
         return
     if not isinstance(body, PlatformSignCompleted) or result.status != 200:
         raise ValueError("AEP Platform signing handler returned an invalid response")
-    issued = datetime.fromisoformat(body.issued_at.replace("Z", "+00:00"))
-    expires = datetime.fromisoformat(body.expires_at.replace("Z", "+00:00"))
+    issued = parse_rfc3339(body.issued_at)
+    expires = parse_rfc3339(body.expires_at)
     if (
         body.agent_did != identity.agent_did
         or body.service_did != request.service_did
@@ -600,7 +653,7 @@ async def _validate_sign_result(
             options=VerifyClientAssertionOptions(
                 algorithms=identity.signing_algorithms,
                 audience=request.service_did,
-                current_time=int(issued.timestamp()),
+                current_time=int(current_time.timestamp()),
                 issuer=identity.agent_did,
                 operation=request.op,
                 resource=request.resource,
@@ -662,12 +715,26 @@ def _is_did(value: str) -> bool:
     )
 
 
+def _http_date(value: datetime) -> str:
+    return format_datetime(value.astimezone(UTC), usegmt=True)
+
+
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def _lifecycle_error(status: ManagedAgentStatus) -> str:
-    return f"identity_{status.value}"
+    """Maps a managed status to one of the registered AEP error codes (CORE-ERR-009).
+
+    The registry defines `identity_suspended`, `identity_terminated`, and `identity_unavailable`;
+    there is no `identity_revoked` or `identity_active`, so a revoked identity reports the
+    suspended code and anything else reports the non-punitive one.
+    """
+    if status is ManagedAgentStatus.TERMINATED:
+        return "identity_terminated"
+    if status in {ManagedAgentStatus.SUSPENDED, ManagedAgentStatus.REVOKED}:
+        return "identity_suspended"
+    return "identity_unavailable"
 
 
 def _clone_model(value: ModelT) -> ModelT:

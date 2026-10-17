@@ -36,8 +36,10 @@ from agent_enrollment_protocol.core import (
     parse_platform_sign_response,
     same_origin,
 )
+from agent_enrollment_protocol.core.models import parse_rfc3339
 
-from .transport import AsyncHttpTransport, HttpxTransport
+from .client import _validate_signed_assertion
+from .transport import AsyncHttpTransport, HttpxTransport, _fresh_cache
 from .types import AssertionSigner, IdentityRequest, ServiceIdentity
 
 Clock = Callable[[], datetime]
@@ -57,6 +59,9 @@ class PlatformDiscoveryCacheEntry:
     cache_control: str = ""
     etag: str = ""
     last_modified: str = ""
+    age: str = ""
+    date: str = ""
+    expires: str = ""
 
 
 class PlatformDiscoveryCache(Protocol):
@@ -258,7 +263,7 @@ class PlatformIdentityProvider:
                     raise ValueError(
                         "AEP Platform pending Sign stages require distinct idempotency keys"
                     )
-                response = await self._sign(identity, claims, context, key)
+                response = await self._sign(identity, claims, context, key, algorithms)
                 if isinstance(response, PlatformSignCompleted):
                     return response.client_assertion
                 pending = PlatformPendingSign(
@@ -279,6 +284,7 @@ class PlatformIdentityProvider:
         claims: ClientAssertionClaims,
         platform_context: Mapping[str, object] | None,
         idempotency_key: str,
+        algorithms: tuple[SigningAlgorithm, ...],
     ) -> PlatformSignCompleted | PlatformSignPending:
         discovery = await self._discover()
         agent_identity_id = identity.metadata.get("agent_identity_id", "")
@@ -311,7 +317,14 @@ class PlatformIdentityProvider:
             if status != 202:
                 raise ValueError("AEP Platform returned an invalid pending Sign status")
             return response
-        if status != 200 or not _valid_completed_sign(response, identity, claims):
+        if status != 200 or not _valid_completed_sign(
+            response,
+            identity,
+            claims,
+            tuple(value for value in discovery.document.signing.algorithms if value in algorithms),
+            self._allow_insecure_loopback,
+            int(self._clock().timestamp()),
+        ):
             raise ValueError("AEP Platform returned an invalid completed Sign response")
         return response
 
@@ -380,6 +393,9 @@ class PlatformIdentityProvider:
                 cache_control=_header(response.headers, "cache-control") or cached.cache_control,
                 etag=_header(response.headers, "etag") or cached.etag,
                 last_modified=_header(response.headers, "last-modified") or cached.last_modified,
+                age=_header(response.headers, "age") or "",
+                date=_header(response.headers, "date") or "",
+                expires=_header(response.headers, "expires") or cached.expires,
             )
         if response.status < 200 or response.status >= 300:
             raise PlatformCommandError(response.status)
@@ -398,6 +414,9 @@ class PlatformIdentityProvider:
             cache_control=_header(response.headers, "cache-control") or "",
             etag=_header(response.headers, "etag") or "",
             last_modified=_header(response.headers, "last-modified") or "",
+            age=_header(response.headers, "age") or "",
+            date=_header(response.headers, "date") or "",
+            expires=_header(response.headers, "expires") or "",
         )
 
     async def _command(
@@ -551,14 +570,26 @@ def _valid_completed_sign(
     response: PlatformSignCompleted,
     identity: ServiceIdentity,
     claims: ClientAssertionClaims,
+    algorithms: tuple[str, ...],
+    allow_insecure_loopback: bool,
+    current_time: int,
 ) -> bool:
-    issued_at = datetime.fromisoformat(response.issued_at.replace("Z", "+00:00"))
-    expires_at = datetime.fromisoformat(response.expires_at.replace("Z", "+00:00"))
+    issued_at = parse_rfc3339(response.issued_at)
+    expires_at = parse_rfc3339(response.expires_at)
+    parsed = _validate_signed_assertion(
+        response.client_assertion,
+        claims,
+        tuple(value for value in algorithms if value in identity.signing_algorithms),
+        allow_insecure_loopback,
+        current_time,
+    )
     return (
         response.agent_did == identity.agent_did
         and response.service_did == identity.service_did
         and response.jti == claims.jti
-        and int((expires_at - issued_at).total_seconds()) == claims.exp - claims.iat
+        and int(issued_at.timestamp()) == parsed.iat
+        and int(expires_at.timestamp()) == parsed.exp
+        and (expires_at - issued_at).total_seconds() == claims.exp - claims.iat
     )
 
 
@@ -570,6 +601,9 @@ def _copy_cache_entry(entry: PlatformDiscoveryCacheEntry) -> PlatformDiscoveryCa
         cache_control=entry.cache_control,
         etag=entry.etag,
         last_modified=entry.last_modified,
+        age=entry.age,
+        date=entry.date,
+        expires=entry.expires,
     )
 
 
@@ -602,27 +636,21 @@ def _validate_cache_entry(
         cache_control=entry.cache_control,
         etag=entry.etag,
         last_modified=entry.last_modified,
+        age=entry.age,
+        date=entry.date,
+        expires=entry.expires,
     )
 
 
 def _cache_fresh(entry: PlatformDiscoveryCacheEntry, now: datetime) -> bool:
-    if any(
-        _cache_directive(entry.cache_control, directive) is not None
-        for directive in ("no-cache", "no-store")
-    ):
-        return False
-    maximum_age = _cache_directive(entry.cache_control, "max-age")
-    if maximum_age is None:
-        seconds = 300
-    else:
-        try:
-            seconds = int(maximum_age.strip('"'))
-        except ValueError:
-            return False
-        if seconds < 0:
-            return False
-    elapsed = (now - entry.cached_at).total_seconds()
-    return 0 <= elapsed < seconds
+    return _fresh_cache(
+        cache_control=entry.cache_control,
+        cached_at=entry.cached_at,
+        now=now,
+        age=entry.age,
+        date=entry.date,
+        expires=entry.expires,
+    )
 
 
 def _cache_directive(value: str, name: str) -> str | None:

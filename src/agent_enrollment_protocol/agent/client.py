@@ -48,6 +48,8 @@ from agent_enrollment_protocol.core import (
     require_service_origin_binding,
     same_origin,
 )
+from agent_enrollment_protocol.core.models import _normalize_resource_uri, parse_rfc3339
+from agent_enrollment_protocol.core.validation import _reject_duplicate_members
 
 from .stores import (
     MemoryCredentialStore,
@@ -55,7 +57,7 @@ from .stores import (
     MemoryInspectCache,
     RandomIdempotencyKeyProvider,
 )
-from .transport import AsyncHttpTransport, HttpxTransport
+from .transport import AsyncHttpTransport, HttpxTransport, _fresh_cache
 from .types import (
     AgentCommandError,
     AssertionSigner,
@@ -65,8 +67,10 @@ from .types import (
     CommandResult,
     CredentialRecord,
     CredentialStore,
+    CredentialUnavailableError,
     EnrollmentStateError,
     EnrollOptions,
+    ExistingIdentityProvider,
     GrantOptions,
     GrantResult,
     IdempotencyKeyProvider,
@@ -173,7 +177,8 @@ class ServiceSession:
 
     async def inspect(self) -> Inspection:
         async with self._inspection_lock:
-            return await asyncio.wait_for(self._inspect(), timeout=self._agent._request_timeout)
+            async with asyncio.timeout(self._agent._request_timeout):
+                return await self._inspect()
 
     async def _inspect(self) -> Inspection:
         inspect_url = urljoin(self._service_url, AEP_WELL_KNOWN_PATH)
@@ -241,6 +246,9 @@ class ServiceSession:
                     etag=_header(response.headers, "etag") or cached.etag,
                     last_modified=_header(response.headers, "last-modified")
                     or cached.last_modified,
+                    age=_header(response.headers, "age") or "",
+                    date=_header(response.headers, "date") or "",
+                    expires=_header(response.headers, "expires") or cached.expires,
                 )
                 if _cache_directive(entry.cache_control, "no-store") is not None:
                     await self._agent._inspect_cache.delete_inspect(inspect_url)
@@ -270,6 +278,9 @@ class ServiceSession:
                 cache_control=_header(response.headers, "cache-control") or "",
                 etag=_header(response.headers, "etag") or "",
                 last_modified=_header(response.headers, "last-modified") or "",
+                age=_header(response.headers, "age") or "",
+                date=_header(response.headers, "date") or "",
+                expires=_header(response.headers, "expires") or "",
             )
             if _cache_directive(entry.cache_control, "no-store") is not None:
                 await self._agent._inspect_cache.delete_inspect(inspect_url)
@@ -413,7 +424,7 @@ class ServiceSession:
         if credential is not None:
             record = CredentialRecord(
                 credential_id=credential.credential_id,
-                expires_at=datetime.fromisoformat(credential.expires_at.replace("Z", "+00:00")),
+                expires_at=parse_rfc3339(credential.expires_at),
                 grant_type=grant_type,
                 issued_at=self._agent._clock(),
                 payload=bytes(raw),
@@ -424,6 +435,8 @@ class ServiceSession:
         return CommandResult(body=grant_result, status=result.status, url=result.url)
 
     async def revoke(self, options: RevokeOptions) -> CommandResult[RevokeResponse]:
+        if {"all_grant_types", "grant_type", "credential_id"}.intersection(options.parameters):
+            raise ValueError("AEP Revoke selectors must be provided through RevokeOptions")
         if options.all_grant_types:
             request_data: dict[str, object] = dict(options.parameters)
             request_data["all_grant_types"] = "true"
@@ -466,9 +479,9 @@ class ServiceSession:
             inspection.document.service.did
         ):
             matches = (
-                options.all_grant_types
-                or record.credential_id == options.credential_id
-                or (options.credential_id is None and record.grant_type == options.grant_type)
+                request.all_grant_types == "true"
+                or record.credential_id == request.credential_id
+                or (request.credential_id is None and record.grant_type == request.grant_type)
             )
             if matches:
                 await self._agent._credential_store.delete_credential(
@@ -477,22 +490,29 @@ class ServiceSession:
         return result
 
     async def authentication_headers(self, options: AuthenticationOptions) -> Mapping[str, str]:
-        if options.client_assertion_only and (options.credential_id or options.grant_type):
+        selected = options.credential_id is not None or options.grant_type is not None
+        if options.client_assertion_only and selected:
             raise ValueError("AEP credential selection cannot accompany client-assertion-only mode")
+        if options.credential_id == "" or options.grant_type == "":
+            raise ValueError("AEP credential selectors must not be empty")
         inspection = await self.inspect()
         _require_resource(options.resource, self._service_url, self._agent._allow_insecure_loopback)
         carrier = AuthorizationCarrier(options.carrier)
         methods = (
             inspection.document.authentication.methods if inspection.document.authentication else ()
         )
+        if options.allowed_methods is not None:
+            methods = tuple(method for method in methods if method in options.allowed_methods)
         if not options.client_assertion_only:
             record = await self._find_credential(inspection.document.service.did, methods, options)
             if record is not None:
                 return _credential_headers(record, carrier)
-            if options.credential_id or options.grant_type:
-                raise ValueError("requested AEP credential was not found")
+            if selected:
+                raise CredentialUnavailableError("requested AEP credential was not found")
         if AEP_AUTHENTICATION_METHOD_JWT not in methods:
-            raise ValueError("AEP Service does not advertise a compatible authentication method")
+            raise CredentialUnavailableError(
+                "AEP Service does not advertise a compatible authentication method"
+            )
         identity = await self._resolve_identity(inspection)
         signer = await self._agent._identity_provider.signer_for(identity)
         if not callable(signer):
@@ -533,10 +553,21 @@ class ServiceSession:
         inspection = await self.inspect()
         if command.value not in inspection.document.commands.supported:
             raise ValueError(f"AEP Service does not advertise {command.value}")
-        identity = await self._agent._identity_store.find_identity(inspection.document.service.did)
-        if identity is None:
-            raise AgentCommandError(401, "AEP Grant requires an existing enrolled identity")
-        _validate_identity(identity, inspection)
+        async with self._agent._identity_lock:
+            identity = await self._agent._identity_store.find_identity(
+                inspection.document.service.did
+            )
+            provider = self._agent._identity_provider
+            if identity is None and isinstance(provider, ExistingIdentityProvider):
+                identity = await provider.find_identity_by_service_did(
+                    inspection.document.service.did
+                )
+                if identity is not None:
+                    _validate_identity(identity, inspection)
+                    await self._agent._identity_store.save_identity(identity)
+            if identity is None:
+                raise AgentCommandError(401, "AEP Grant requires an existing enrolled identity")
+            _validate_identity(identity, inspection)
         signer = await self._agent._identity_provider.signer_for(identity)
         if not callable(signer):
             raise ValueError("AEP identity provider returned no assertion signer")
@@ -614,12 +645,10 @@ class ServiceSession:
             headers["Content-Type"] = AEP_MEDIA_TYPE
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
-        response = await asyncio.wait_for(
-            self._agent._command_transport.send(
+        async with asyncio.timeout(self._agent._request_timeout):
+            response = await self._agent._command_transport.send(
                 HttpRequest(method=method, url=url, headers=headers, body=data)
-            ),
-            timeout=self._agent._request_timeout,
-        )
+            )
         _bounded(response.body, self._agent._maximum_response_bytes)
         if response.status < 200 or response.status >= 300:
             problem = None
@@ -658,7 +687,9 @@ class ServiceSession:
             "sub": identity.agent_did,
         }
         if resource is not None:
-            claim_data["resource"] = resource
+            claim_data["resource"] = _normalize_resource_uri(
+                resource, allow_insecure_loopback=self._agent._allow_insecure_loopback
+            )
         claims = ClientAssertionClaims.model_validate(
             claim_data,
             context={"allow_insecure_loopback": self._agent._allow_insecure_loopback},
@@ -672,7 +703,11 @@ class ServiceSession:
         if not assertion:
             raise ValueError("AEP assertion signer returned an empty assertion")
         _validate_signed_assertion(
-            assertion, claims, algorithms, self._agent._allow_insecure_loopback
+            assertion,
+            claims,
+            algorithms,
+            self._agent._allow_insecure_loopback,
+            int(self._agent._clock().timestamp()),
         )
         return assertion
 
@@ -682,16 +717,18 @@ class ServiceSession:
         methods: Sequence[str],
         options: AuthenticationOptions,
     ) -> CredentialRecord | None:
-        if options.grant_type and options.grant_type not in methods:
+        if options.grant_type is not None and options.grant_type not in methods:
             raise ValueError("AEP Service does not advertise a compatible authentication method")
-        if options.credential_id:
+        if options.credential_id is not None:
             record = await self._agent._credential_store.find_credential(
                 service_did, options.credential_id
             )
             if record is None:
                 return None
             _validate_credential_record(record, service_did, self._agent._clock())
-            if options.grant_type and record.grant_type != options.grant_type:
+            if record.credential_id != options.credential_id:
+                raise ValueError("stored AEP credential does not match requested credential ID")
+            if options.grant_type is not None and record.grant_type != options.grant_type:
                 raise ValueError("stored AEP credential does not match requested grant type")
             if record.grant_type not in methods:
                 raise ValueError(
@@ -783,9 +820,12 @@ def _parse_credential(grant_type: str, data: bytes) -> BuiltInCredential | None:
     elif grant_type == "oauth-bearer":
         return parse_json_model(data, OAuthBearerGrantResponse, "Grant response")
     else:
+        _reject_duplicate_members(data, "Grant response")
         parsed = json.loads(data)
         if not isinstance(parsed, dict):
             raise ValueError("AEP Grant response must be a JSON object")
+        if not isinstance(parsed.get("credential_id"), str) or not parsed["credential_id"]:
+            raise ValueError("AEP Grant response requires a credential_id")
         return None
 
 
@@ -842,7 +882,7 @@ def _validate_credential_record(record: CredentialRecord, service_did: str, now:
     if (
         credential is None
         or credential.credential_id != record.credential_id
-        or datetime.fromisoformat(credential.expires_at.replace("Z", "+00:00")) != record.expires_at
+        or parse_rfc3339(credential.expires_at) != record.expires_at
     ):
         raise ValueError("stored AEP credential metadata does not match its payload")
 
@@ -862,7 +902,8 @@ def _validate_signed_assertion(
     claims: ClientAssertionClaims,
     algorithms: tuple[str, ...],
     allow_insecure_loopback: bool,
-) -> None:
+    current_time: int,
+) -> ClientAssertionClaims:
     try:
         header, payload = decode_jwt_unverified(assertion)
         parsed_claims = ClientAssertionClaims.model_validate_json(
@@ -877,11 +918,15 @@ def _validate_signed_assertion(
         or header.get("alg") not in algorithms
         or not isinstance(key_id, str)
         or key_id.partition("#")[0] != claims.iss
-        or parsed_claims != claims
+        or parsed_claims.model_copy(update={"iat": claims.iat, "exp": claims.exp}) != claims
+        or parsed_claims.exp - parsed_claims.iat != claims.exp - claims.iat
+        or parsed_claims.iat > current_time
+        or parsed_claims.exp <= current_time
     ):
         raise ValueError(
             "AEP assertion signer returned an assertion that does not match the request"
         )
+    return parsed_claims
 
 
 def _inspection_from_cache(
@@ -899,21 +944,14 @@ def _inspection_from_cache(
 
 
 def _cache_fresh(entry: InspectCacheEntry, now: datetime) -> bool:
-    if (
-        _cache_directive(entry.cache_control, "no-cache") is not None
-        or _cache_directive(entry.cache_control, "no-store") is not None
-    ):
-        return False
-    value = _cache_directive(entry.cache_control, "max-age")
-    seconds = 300
-    if value is not None:
-        try:
-            seconds = int(value)
-        except ValueError:
-            return False
-        if seconds < 0:
-            return False
-    return entry.cached_at + timedelta(seconds=seconds) > now
+    return _fresh_cache(
+        cache_control=entry.cache_control,
+        cached_at=entry.cached_at,
+        now=now,
+        age=entry.age,
+        date=entry.date,
+        expires=entry.expires,
+    )
 
 
 def _cache_directive(value: str, name: str) -> str | None:

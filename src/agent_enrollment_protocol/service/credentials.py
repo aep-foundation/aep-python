@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import re
+import secrets
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -26,6 +27,7 @@ from agent_enrollment_protocol.core import (
     parse_authorization,
 )
 from agent_enrollment_protocol.core.errors import AepAuthorizationError
+from agent_enrollment_protocol.core.models import parse_rfc3339
 
 from .types import (
     AuthenticatedPrincipal,
@@ -88,7 +90,7 @@ class _StoredCredentialHandler(Generic[CredentialT]):
         config: GrantTypeConfig,
         options: StoredCredentialGrantTypeOptions[CredentialT],
     ) -> None:
-        self._config = config
+        self._config = config.model_copy(deep=True)
         self._grant_type = grant_type
         self._issue = options.issue
         self._store = options.store
@@ -98,6 +100,7 @@ class _StoredCredentialHandler(Generic[CredentialT]):
         credential = await self._issue(request, context)
         parsed = _validate_built_in_credential(self._grant_type, credential)
         _validate_issued_credential_config(parsed, self._config)
+        _require_encodable_basic(parsed)
         expires_at = _parse_expiry(parsed.expires_at)
         if expires_at <= context.current_time:
             raise ValueError("AEP issued credential must expire after issuance")
@@ -162,6 +165,8 @@ class _MemoryCredentialRecord:
     grant_type: str
     header: str
     scopes: tuple[str, ...]
+    salt: bytes
+    username: str
     verifier: bytes
     revoked_at: datetime | None = None
 
@@ -172,17 +177,25 @@ class MemoryServiceCredentialStore:
         self._records: dict[str, _MemoryCredentialRecord] = {}
 
     async def save_credential(self, record: ServiceCredentialRecord) -> None:
-        stored = _memory_credential_record(record)
+        stored = await _memory_credential_record(record)
         async with self._lock:
             if record.credential_id in self._records:
                 raise ValueError("AEP credential identifier has already been issued")
-            if any(
-                existing.grant_type == stored.grant_type
-                and existing.header == stored.header
-                and hmac.compare_digest(existing.verifier, stored.verifier)
-                for existing in self._records.values()
-            ):
-                raise ValueError("AEP credential secret has already been issued")
+            for existing in self._records.values():
+                if (
+                    existing.grant_type == stored.grant_type
+                    and existing.header == stored.header
+                    and existing.username == stored.username
+                    and hmac.compare_digest(
+                        existing.verifier,
+                        await _credential_digest(
+                            _credential_secret(record.credential),
+                            existing.salt,
+                            stored.grant_type == AEP_GRANT_TYPE_BASIC,
+                        ),
+                    )
+                ):
+                    raise ValueError("AEP credential secret has already been issued")
             self._records[record.credential_id] = stored
 
     async def authenticate_credential(
@@ -194,14 +207,27 @@ class MemoryServiceCredentialStore:
         if len(presentations) != 1:
             return None
         header, value = presentations[0]
-        verifier = hashlib.sha256(value.encode()).digest()
+        username = ""
+        if grant_type == AEP_GRANT_TYPE_BASIC:
+            try:
+                username = base64.b64decode(value, validate=True).decode("utf-8").partition(":")[0]
+            except (ValueError, UnicodeDecodeError):
+                return None
         for record in records:
             if (
                 record.grant_type == grant_type
                 and record.header == header
+                and record.username == username
                 and record.revoked_at is None
                 and record.expires_at > request.current_time
-                and hmac.compare_digest(record.verifier, verifier)
+                and hmac.compare_digest(
+                    record.verifier,
+                    await _credential_digest(
+                        value,
+                        record.salt,
+                        grant_type == AEP_GRANT_TYPE_BASIC,
+                    ),
+                )
             ):
                 return CredentialMatch(
                     agent_did=record.agent_did,
@@ -241,7 +267,7 @@ class MemoryServiceCredentialStore:
                     self._records[credential_id] = replace(record, revoked_at=revoked_at)
 
 
-def _memory_credential_record(record: ServiceCredentialRecord) -> _MemoryCredentialRecord:
+async def _memory_credential_record(record: ServiceCredentialRecord) -> _MemoryCredentialRecord:
     _require_aware_time(record.created_at, "issuance")
     _require_aware_time(record.expires_at, "expiration")
     if (
@@ -257,23 +283,38 @@ def _memory_credential_record(record: ServiceCredentialRecord) -> _MemoryCredent
         or _parse_expiry(credential.expires_at) != record.expires_at
     ):
         raise ValueError("AEP credential record metadata does not match its credential")
-    header = "authorization"
-    if isinstance(credential, OAuthBearerGrantResponse):
-        secret = credential.access_token
-    elif isinstance(credential, ApiKeyGrantResponse):
-        header = credential.header.lower()
-        secret = credential.api_key
-    else:
-        secret = base64.b64encode(f"{credential.username}:{credential.password}".encode()).decode()
+    salt = secrets.token_bytes(16)
     return _MemoryCredentialRecord(
         agent_did=record.agent_did,
         credential_id=record.credential_id,
         expires_at=record.expires_at,
         grant_type=record.grant_type,
-        header=header,
+        header=credential.header.lower()
+        if isinstance(credential, ApiKeyGrantResponse)
+        else "authorization",
         scopes=tuple(credential.scopes or ()),
-        verifier=hashlib.sha256(secret.encode()).digest(),
+        salt=salt,
+        username=credential.username if isinstance(credential, BasicGrantResponse) else "",
+        verifier=await _credential_digest(
+            _credential_secret(credential), salt, isinstance(credential, BasicGrantResponse)
+        ),
     )
+
+
+def _credential_secret(credential: BuiltInCredential) -> str:
+    if isinstance(credential, ApiKeyGrantResponse):
+        return credential.api_key
+    if isinstance(credential, OAuthBearerGrantResponse):
+        return credential.access_token
+    return base64.b64encode(f"{credential.username}:{credential.password}".encode()).decode()
+
+
+async def _credential_digest(value: str, salt: bytes, password: bool) -> bytes:
+    if password:
+        return await asyncio.to_thread(
+            hashlib.scrypt, value.encode(), salt=salt, n=16384, r=8, p=1, dklen=32
+        )
+    return hashlib.sha256(salt + value.encode()).digest()
 
 
 def _credential_presentations(
@@ -325,6 +366,19 @@ def _validate_issued_credential_config(
         raise ValueError("AEP issued API-key header is not advertised by the Service")
 
 
+def _require_encodable_basic(credential: BuiltInCredential) -> None:
+    """BSC-RSP-003: issued Basic credentials must survive RFC 7617 encoding unchanged.
+
+    RFC 7617 leaves the user-pass charset undefined without a `charset` parameter, so a client
+    encoding a non-ASCII value as ISO-8859-1 and a Service storing it as UTF-8 derive different
+    bytes from the same credential and authentication fails.
+    """
+    if not isinstance(credential, BasicGrantResponse):
+        return
+    if not credential.username.isascii() or not credential.password.isascii():
+        raise ValueError("AEP issued Basic credentials must be encodable as US-ASCII")
+
+
 def _configured_api_key_headers(config: GrantTypeConfig) -> frozenset[str] | None:
     value = config.to_wire().get("header_names")
     if value is None:
@@ -347,7 +401,7 @@ def _configured_api_key_headers(config: GrantTypeConfig) -> frozenset[str] | Non
 
 
 def _parse_expiry(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return parse_rfc3339(value)
 
 
 def _require_aware_time(value: datetime, label: str) -> None:

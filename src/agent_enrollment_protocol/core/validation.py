@@ -26,7 +26,7 @@ class ValidationResult(Generic[ValueT]):
 def parse_json_model(data: str | bytes, model: type[ModelT], document_type: str) -> ModelT:
     _reject_duplicate_members(data, document_type)
     try:
-        return model.model_validate_json(data)
+        return model.model_validate_json(data, by_alias=True, by_name=False)
     except ValidationError as error:
         raise AepValidationError(
             f"Invalid AEP {document_type}.", validation_issues(error)
@@ -52,7 +52,9 @@ def parse_platform_sign_response(data: str | bytes) -> PlatformSignResponse:
 def _parse_json_value(data: str | bytes, value_type: Any, document_type: str) -> Any:
     _reject_duplicate_members(data, document_type)
     try:
-        return TypeAdapter(value_type).validate_json(data, strict=True)
+        return TypeAdapter(value_type).validate_json(
+            data, strict=True, by_alias=True, by_name=False
+        )
     except ValidationError as error:
         raise AepValidationError(
             f"Invalid AEP {document_type}.", validation_issues(error)
@@ -69,9 +71,13 @@ def _reject_duplicate_members(data: str | bytes, document_type: str) -> None:
         return result
 
     try:
-        json.loads(data, object_pairs_hook=pairs)
+        json.loads(data, object_pairs_hook=pairs, parse_constant=_reject_json_constant)
     except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
         raise AepValidationError(
             f"Invalid AEP {document_type} JSON.",
             (ValidationIssue(path="$", message=str(error)),),
         ) from error
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"invalid JSON constant: {value}")

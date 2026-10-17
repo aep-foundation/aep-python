@@ -36,6 +36,59 @@ def claims(*, op: AssertionOperation = AssertionOperation.ENROLL) -> ClientAsser
     return ClientAssertionClaims.model_validate(values)
 
 
+@pytest.mark.parametrize(
+    "asserted,target,accepted,loopback",
+    [
+        ("https://RESOURCE.EXAMPLE:443/items/1", "https://resource.example/items/1", True, False),
+        ("https://resource.example", "https://resource.example/", True, False),
+        ("https://[ABCD::1]:443/", "https://[abcd::1]/", True, False),
+        ("http://LOCALHOST:80/private", "http://localhost/private", True, True),
+        ("https://resource.example:8443/", "https://resource.example/", False, False),
+        ("https://resource.example/private", "https://resource.example/Private", False, False),
+        ("https://resource.example/private", "https://resource.example/private/", False, False),
+        ("https://resource.example/a%2Fb", "https://resource.example/a/b", False, False),
+        ("https://resource.example/?a=1&b=2", "https://resource.example/?b=2&a=1", False, False),
+        ("https://resource.example/private?", "https://resource.example/private", False, False),
+        ("https://resource.example/private?", "https://RESOURCE.EXAMPLE:443/private?", True, False),
+        ("https://resource.example/private", "https://resource.example/private#", False, False),
+        ("https://resource.example/private", "https://@resource.example/private", False, False),
+        ("https://resource.example/private", "https://resource.example:bad/private", False, False),
+    ],
+)
+def test_resource_comparison_preserves_target_identity(
+    asserted: str,
+    target: str,
+    accepted: bool,
+    loopback: bool,
+) -> None:
+    key = ed25519.Ed25519PrivateKey.generate()
+    original = claims(op=AssertionOperation.AUTHENTICATE).model_copy(update={"resource": asserted})
+    token = sign_client_assertion(
+        original, key=key, algorithm=SigningAlgorithm.EDDSA, allow_insecure_loopback=loopback
+    )
+    options = VerifyClientAssertionOptions(
+        resource=target, current_time=NOW, allow_insecure_loopback=loopback
+    )
+    if accepted:
+        assert verify_client_assertion(token, key=key.public_key(), options=options) == original
+    else:
+        with pytest.raises(AepAssertionError, match="resource"):
+            verify_client_assertion(token, key=key.public_key(), options=options)
+
+
+def test_resource_expectation_cannot_accept_an_assertion_without_a_resource() -> None:
+    key = ed25519.Ed25519PrivateKey.generate()
+    token = sign_client_assertion(claims(), key=key, algorithm=SigningAlgorithm.EDDSA)
+    with pytest.raises(AepAssertionError, match="resource"):
+        verify_client_assertion(
+            token,
+            key=key.public_key(),
+            options=VerifyClientAssertionOptions(
+                resource="https://resource.example/private", current_time=NOW
+            ),
+        )
+
+
 @pytest.mark.parametrize("algorithm", [SigningAlgorithm.EDDSA, SigningAlgorithm.ES256])
 def test_sign_verify_and_decode_client_assertions(algorithm: SigningAlgorithm) -> None:
     private_key: object
@@ -208,3 +261,59 @@ def test_unverified_decoder_rejects_non_jwt_and_non_object_parts() -> None:
     duplicate = urlsafe_b64encode(b'{"value":1,"value":2}').decode().rstrip("=")
     with pytest.raises(AepAssertionError):
         decode_jwt_unverified(f"{duplicate}.{object_part}.signature")
+
+
+@pytest.mark.parametrize("not_before", [NOW + 10, NOW + 10.5])
+def test_not_before_uses_the_configured_clock_and_tolerance(not_before: float) -> None:
+    key = ed25519.Ed25519PrivateKey.generate()
+    payload = {**claims().to_wire(), "nbf": not_before}
+    token = jwt.encode(payload, key, algorithm="EdDSA", headers={"kid": payload["iss"]})
+    options = VerifyClientAssertionOptions(current_time=NOW + 11)
+    assert (
+        verify_client_assertion(token, key=key.public_key(), options=options).jti == "assertion-1"
+    )
+    with pytest.raises(AepAssertionError, match="not yet valid"):
+        verify_client_assertion(
+            token, key=key.public_key(), options=VerifyClientAssertionOptions(current_time=NOW + 9)
+        )
+    assert (
+        verify_client_assertion(
+            token,
+            key=key.public_key(),
+            options=VerifyClientAssertionOptions(current_time=NOW + 9, clock_tolerance_seconds=2),
+        ).jti
+        == "assertion-1"
+    )
+
+
+@pytest.mark.parametrize("not_before", [None, True, "1700000000", [], {}])
+def test_not_before_rejects_non_numeric_dates(not_before: object) -> None:
+    key = ed25519.Ed25519PrivateKey.generate()
+    payload = {**claims().to_wire(), "nbf": not_before}
+    token = jwt.encode(payload, key, algorithm="EdDSA", headers={"kid": payload["iss"]})
+    with pytest.raises(AepAssertionError, match="invalid nbf"):
+        verify_client_assertion(
+            token, key=key.public_key(), options=VerifyClientAssertionOptions(current_time=NOW)
+        )
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_jwt_boundaries_reject_non_json_constants(value: float) -> None:
+    key = ed25519.Ed25519PrivateKey.generate()
+    payload = {**claims().to_wire(), "example.future": {"value": value}}
+    token = jwt.encode(payload, key, algorithm="EdDSA", headers={"kid": payload["iss"]})
+    with pytest.raises(AepAssertionError):
+        decode_jwt_unverified(token)
+    with pytest.raises(AepAssertionError):
+        verify_client_assertion(
+            token, key=key.public_key(), options=VerifyClientAssertionOptions(current_time=NOW)
+        )
+    header_token = jwt.encode(
+        claims().to_wire(), key, algorithm="EdDSA", headers={"kid": payload["iss"], "future": value}
+    )
+    with pytest.raises(AepAssertionError):
+        verify_client_assertion(header_token, key=key.public_key())
+    with pytest.raises(ValueError):
+        sign_client_assertion(
+            ClientAssertionClaims.model_validate(payload), key=key, algorithm=SigningAlgorithm.EDDSA
+        )

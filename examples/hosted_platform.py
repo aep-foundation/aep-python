@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+import jwt
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from agent_enrollment_protocol.core import (
@@ -18,8 +19,11 @@ from agent_enrollment_protocol.core import (
     PlatformSignCompleted,
     PlatformSignRequest,
     SigningAlgorithm,
+    VerifyClientAssertionOptions,
     did_web_document_url,
+    select_did_web_public_jwk,
     sign_client_assertion,
+    verify_client_assertion,
 )
 from agent_enrollment_protocol.platform import (
     AuthorizationRequest,
@@ -101,6 +105,8 @@ class EphemeralKeyStore:
 
 
 async def run(client: httpx.AsyncClient) -> None:
+    # These fixed identifiers and permissive authorizer serve one local caller. Production
+    # routes authenticate callers and supply their identity and permissions to the Platform.
     platform = Platform(
         PlatformOptions(
             agent_did_id_generator=lambda: "agent-one",
@@ -129,18 +135,24 @@ async def run(client: httpx.AsyncClient) -> None:
     )
 
     discovery = platform.discovery()
-    print("Discovery:", discovery.body.platform.name if discovery.body else "missing")
+    if discovery.status != 200 or discovery.body is None:
+        raise RuntimeError("The Platform did not return discovery metadata")
+    print("Discovery:", discovery.body.platform.name)
 
     provisioned = await platform.provision(
         PlatformProvisionRequest(service_did=SERVICE_DID), context
     )
     identity = provisioned.body
-    if not isinstance(identity, PlatformAgentIdentity):
+    if provisioned.status != 200 or not isinstance(identity, PlatformAgentIdentity):
         raise RuntimeError("The Platform did not provision an Agent identity")
     print("Provision:", identity.agent_did)
 
     document = await platform.did_document("agent-one")
-    if not isinstance(document.body, dict):
+    if (
+        document.status != 200
+        or not isinstance(document.body, dict)
+        or document.body.get("id") != identity.agent_did
+    ):
         raise RuntimeError("The Platform did not publish a DID document")
     print("DID document:", document.body["id"])
 
@@ -157,24 +169,70 @@ async def run(client: httpx.AsyncClient) -> None:
             current_time=datetime.now(UTC),
         ),
     )
-    if not isinstance(signed.body, PlatformSignCompleted):
+    if signed.status != 200 or not isinstance(signed.body, PlatformSignCompleted):
         raise RuntimeError("The Platform did not return a signed assertion")
+    # Verify with the published public key, not the key store's private signing key.
+    public_jwk = select_did_web_public_jwk(
+        document.body, did=identity.agent_did, key_id=identity.key_id
+    )
+    verified = verify_client_assertion(
+        signed.body.client_assertion,
+        key=jwt.PyJWK.from_dict(public_jwk).key,
+        options=VerifyClientAssertionOptions(
+            audience=SERVICE_DID,
+            issuer=identity.agent_did,
+            subject=identity.agent_did,
+            operation=AssertionOperation.ENROLL,
+        ),
+    )
+    if verified.jti != signed.body.jti:
+        raise RuntimeError("The signed assertion does not match its public metadata")
     print("Sign:", signed.body.agent_did, signed.body.jti)
 
     listed = await platform.list(
         IdentityListQuery(service_did=SERVICE_DID),
         RequestContext(principal="developer-one", current_time=datetime.now(UTC)),
     )
-    print("List:", listed.body.count if listed.body else "missing", "identity")
+    if (
+        listed.status != 200
+        or listed.body is None
+        or listed.body.count != "1"
+        or len(listed.body.data) != 1
+        or listed.body.data[0].agent_identity_id != identity.agent_identity_id
+    ):
+        raise RuntimeError("The Platform did not list the provisioned identity")
+    print("List:", listed.body.count, "identity")
 
     suspended = await platform.update_identity(
         identity.agent_identity_id,
         PlatformLifecycleRequest(status=ManagedAgentStatus.SUSPENDED),
         RequestContext(principal="developer-one", current_time=datetime.now(UTC)),
     )
-    if not isinstance(suspended.body, PlatformAgentIdentity):
+    if (
+        suspended.status != 200
+        or not isinstance(suspended.body, PlatformAgentIdentity)
+        or suspended.body.status is not ManagedAgentStatus.SUSPENDED
+    ):
         raise RuntimeError("The Platform did not update the hosted identity")
     print("Lifecycle:", suspended.body.status.value)
+    refused = await platform.sign(
+        identity.agent_identity_id,
+        PlatformSignRequest(
+            jti="assertion-after-suspension", op=AssertionOperation.ENROLL, service_did=SERVICE_DID
+        ),
+        RequestContext(
+            principal="developer-one",
+            idempotency_key="sign-after-suspension",
+            current_time=datetime.now(UTC),
+        ),
+    )
+    if (
+        refused.status != 403
+        or refused.problem is None
+        or refused.problem.code != "identity_suspended"
+    ):
+        raise RuntimeError("The suspended identity was not refused for signing")
+    print("Suspended signing:", refused.status, refused.problem.code)
 
 
 async def main() -> None:

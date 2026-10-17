@@ -35,6 +35,7 @@ from agent_enrollment_protocol.agent.client import (
 )
 from agent_enrollment_protocol.agent.types import IdentityRequest
 from agent_enrollment_protocol.core import (
+    AepValidationError,
     ApiKeyGrantResponse,
     AuthorizationCarrier,
     ClaimValues,
@@ -347,7 +348,10 @@ async def test_grant_selection_custom_and_inactive_boundaries() -> None:
     )
     custom, _ = configured_agent(
         QueueTransport(response(custom_document.to_wire())),
-        QueueTransport(response({"status": "active"}), response({"custom": "value"})),
+        QueueTransport(
+            response({"status": "active"}),
+            response({"credential_id": "custom-1", "custom": "value"}),
+        ),
     )
     await custom.service("api.example.com").identity()
     result = await custom.service("api.example.com").grant()
@@ -360,7 +364,8 @@ async def test_grant_selection_custom_and_inactive_boundaries() -> None:
         commands={"supported": ["grant", "inspect"], "grant_types": ["future"]},
     )
     missing_status, _ = configured_agent(
-        QueueTransport(response(no_status.to_wire())), QueueTransport(response({"custom": True}))
+        QueueTransport(response(no_status.to_wire())),
+        QueueTransport(response({"credential_id": "custom-2", "custom": True})),
     )
     await missing_status.service("api.example.com").identity()
     assert (await missing_status.service("api.example.com").grant()).status == 200
@@ -388,7 +393,7 @@ async def test_grant_selection_custom_and_inactive_boundaries() -> None:
 async def test_grant_and_revoke_forward_extension_parameters() -> None:
     transport = QueueTransport(
         response({"status": "active"}),
-        response({"custom": "credential"}),
+        response({"credential_id": "custom-3", "custom": "credential"}),
         response({}),
     )
     document = document_with(
@@ -1181,3 +1186,56 @@ async def test_agent_owned_transport_lifecycle(monkeypatch: pytest.MonkeyPatch) 
         pass
     assert inspect.closed
     assert not custom.closed
+
+
+@pytest.mark.asyncio
+async def test_grant_accepts_and_reuses_lowercase_rfc3339_expiry() -> None:
+    document = document_with(authentication={"methods": ["api-key"]})
+    wire = QueueTransport(
+        response({"status": "active"}),
+        response(
+            {
+                "api_key": "secret",
+                "credential_id": "lowercase-time",
+                "header": "X-Key",
+                "expires_at": "2026-01-01t01:00:00z",
+            }
+        ),
+    )
+    agent, _ = configured_agent(QueueTransport(response(document.to_wire())), wire)
+    session = agent.service("api.example.com")
+    await session.identity()
+    await session.grant()
+    headers = await session.authentication_headers(
+        AuthenticationOptions(
+            resource="https://api.example.com/private", credential_id="lowercase-time"
+        )
+    )
+    assert headers == {"X-Key": "secret"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identifier", [None, "", 1, False])
+async def test_extension_grant_requires_a_stable_identifier(identifier: object) -> None:
+    document = document_with(
+        authentication={"methods": ["future"]},
+        commands={"supported": ["inspect", "grant"], "grant_types": ["future"]},
+    )
+    wire = QueueTransport(response({"credential_id": identifier, "secret": "opaque"}))
+    agent, _ = configured_agent(QueueTransport(response(document.to_wire())), wire)
+    session = agent.service("api.example.com")
+    await session.identity()
+    with pytest.raises(ValueError, match="credential_id"):
+        await session.grant()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"credential_id":"one","opaque":NaN}',
+        b'{"credential_id":"one","credential_id":"two"}',
+    ],
+)
+def test_extension_grant_uses_the_core_json_boundary(payload: bytes) -> None:
+    with pytest.raises(AepValidationError, match="JSON"):
+        _parse_credential("future", payload)

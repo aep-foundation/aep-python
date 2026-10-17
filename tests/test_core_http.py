@@ -16,6 +16,8 @@ from agent_enrollment_protocol.core import (
     EnrollResponse,
     HttpRequest,
     HttpResponse,
+    OpenApiSecurityDisposition,
+    OpenApiSecurityResolution,
     OpenApiTrailingSlash,
     ProtectedResourceAuthorization,
     authorization_header_name,
@@ -30,11 +32,13 @@ from agent_enrollment_protocol.core import (
     parse_authorization,
     render_authorization,
     require_service_origin_binding,
+    resolve_openapi_security,
     resolve_openapi_url,
     same_origin,
     select_did_web_public_jwk,
 )
 from agent_enrollment_protocol.core.inspect import _origin
+from agent_enrollment_protocol.core.openapi import SecurityRequirements
 
 from .test_core_models import inspect_document
 
@@ -91,7 +95,7 @@ def test_authorization_rejects_ambiguous_or_invalid_values() -> None:
     with pytest.raises(AepAuthorizationError) as ambiguous:
         parse_authorization("AEP one, AEP two", AuthorizationCarrier.DEDICATED)
     assert ambiguous.value.code == "not_recognized"
-    for value in ("", "Digest value", "AEP", "AEP  value"):
+    for value in ("", "Digest value", "AEP", "AEP ", " AEP value"):
         with pytest.raises(AepAuthorizationError):
             parse_authorization(value)
     with pytest.raises(AepAuthorizationError) as empty:
@@ -103,6 +107,64 @@ def test_authorization_rejects_ambiguous_or_invalid_values() -> None:
             )
         )
     assert empty.value.code == "invalid_request"
+
+
+def test_authorization_separator_follows_the_grammar() -> None:
+    # CORE-AUTH-001 spells the presentation as `"AEP" 1*SP compact-jws`, so repeated separators are
+    # grammar and a field value may carry trailing optional whitespace.
+    for value in ("AEP  assertion", "AEP\tassertion", "AEP assertion ", "AEP   assertion\t"):
+        assert parse_authorization(value).credentials == "assertion"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "AEP one two",
+        "AEP one\ttwo",
+        "AEP compact.jws\x7f",
+        "AEP caf\u00e9",
+    ],
+)
+def test_authorization_refuses_a_value_carrying_more_than_one_credential(value: str) -> None:
+    # CORE-PR-018 forbids a combined value encoding more than one AEP credential, and CORE-AUTH-001
+    # makes the credential visible US-ASCII with no space, so neither carrier may split one.
+    for carrier in AuthorizationCarrier:
+        with pytest.raises(AepAuthorizationError) as rejected:
+            parse_authorization(value, carrier)
+        assert rejected.value.code == "not_recognized"
+
+
+@pytest.mark.parametrize(
+    "credentials", ["one two", "one\ttwo", "line\r\nInjected: header", "null\x00byte", "caf\u00e9"]
+)
+def test_render_authorization_refuses_credentials_that_are_not_a_field_value(
+    credentials: str,
+) -> None:
+    # A credential carrying CR, LF, NUL, or a space would split or extend the rendered field, so
+    # the library refuses to render one rather than emitting it.
+    with pytest.raises(AepAuthorizationError) as rejected:
+        render_authorization(
+            ProtectedResourceAuthorization.model_construct(
+                carrier=AuthorizationCarrier.STANDARD,
+                scheme=AuthorizationScheme.AEP,
+                credentials=credentials,
+            )
+        )
+    assert rejected.value.code == "invalid_request"
+
+
+@pytest.mark.parametrize(
+    "endpoint_base",
+    ["/aep/?next=", "/aep/#fragment", "/aep/../admin/", "/aep/./", "//evil.example/"],
+)
+def test_endpoint_base_must_be_able_to_carry_a_command_path(endpoint_base: str) -> None:
+    # CORE-HTTP-004 appends the command path with one `/` separator. A base carrying a query, a
+    # fragment, or a dot segment would put the command name in the query string or walk out of the
+    # advertised base.
+    with pytest.raises(ValueError, match="origin-relative"):
+        normalize_endpoint_base(endpoint_base)
+    with pytest.raises(ValueError, match="origin-relative"):
+        command_path(Command.ENROLL, endpoint_base)
 
 
 def test_inspect_version_origin_and_did_web_helpers() -> None:
@@ -297,6 +359,96 @@ def test_openapi_url_and_path_helpers() -> None:
             path="/items/one",
             trailing_slash=OpenApiTrailingSlash.STRICT,
         )
+
+
+_AEP = "aepScheme"
+_KEY = "apiKeyScheme"
+_ROOT: tuple[dict[str, tuple[str, ...]], ...] = ({_AEP: ()},)
+_SUPPORTED = (_AEP, _KEY)
+
+
+@pytest.mark.parametrize(
+    ("operation", "disposition"),
+    [
+        (None, OpenApiSecurityDisposition.REQUIRED),
+        ((), OpenApiSecurityDisposition.PUBLIC),
+        (({}, {_AEP: ()}), OpenApiSecurityDisposition.OPTIONAL_ANONYMOUS),
+        (({_AEP: ()}, {_KEY: ()}), OpenApiSecurityDisposition.ALTERNATIVES),
+        (({_AEP: (), _KEY: ()},), OpenApiSecurityDisposition.ALL_REQUIRED),
+    ],
+)
+def test_openapi_security_inheritance(
+    operation: SecurityRequirements | None, disposition: OpenApiSecurityDisposition
+) -> None:
+    # CORE-OAS-011: operation security replaces the root value, an empty array is public, an empty
+    # requirement object is an anonymous alternative, several objects are alternatives, and several
+    # schemes in one object are compound.
+    resolved = resolve_openapi_security(
+        root=_ROOT, operation=operation, supported_schemes=_SUPPORTED
+    )
+    assert resolved.disposition is disposition
+
+
+def test_openapi_security_is_public_without_any_requirement() -> None:
+    resolved = resolve_openapi_security(root=None, operation=None, supported_schemes=_SUPPORTED)
+    assert resolved.disposition is OpenApiSecurityDisposition.PUBLIC
+    assert resolved.satisfiable == ()
+
+
+def test_openapi_security_refuses_to_reduce_an_unsatisfiable_compound_requirement() -> None:
+    # CORE-OAS-013 makes a compound requirement unsupported when any member is, and CORE-OAS-015
+    # forbids reducing it to the member the Agent does support.
+    resolved = resolve_openapi_security(
+        root=None,
+        operation=({_AEP: (), "mtlsScheme": ()},),
+        supported_schemes=(_AEP,),
+    )
+    assert resolved.disposition is OpenApiSecurityDisposition.FALLBACK_LIVE_CHALLENGE
+    assert resolved.satisfiable == ()
+
+
+def test_openapi_security_selects_only_complete_alternatives() -> None:
+    # CORE-OAS-014 permits another complete alternative when a compound requirement is unsupported.
+    resolved = resolve_openapi_security(
+        root=None,
+        operation=({_AEP: (), "mtlsScheme": ()}, {_KEY: ()}),
+        supported_schemes=_SUPPORTED,
+    )
+    assert resolved.disposition is OpenApiSecurityDisposition.ALTERNATIVES
+    assert resolved.satisfiable == ((_KEY,),)
+
+
+def test_openapi_security_dispositions_carry_their_wire_values() -> None:
+    assert [item.value for item in OpenApiSecurityDisposition] == [
+        "public",
+        "optional-anonymous",
+        "required",
+        "alternatives",
+        "all-required",
+        "fallback-live-challenge",
+    ]
+    assert OpenApiSecurityResolution(OpenApiSecurityDisposition.PUBLIC).satisfiable == ()
+
+
+@pytest.mark.parametrize(
+    "did",
+    [
+        "did:web:exa%0Dmple.com",
+        "did:web:exa%0Ample.com",
+        "did:web:exa%09mple.com",
+        "did:web:%20example.com",
+        "did:web:example.com%20",
+        "did:web:example.com%7f",
+    ],
+)
+def test_did_web_host_must_be_visible_ascii(did: str) -> None:
+    # urlsplit strips CR, LF, and tab before parsing, so without this rule the host would be
+    # checked in its sanitized form and then concatenated into the document URL in its raw form,
+    # putting whitespace or a control character into a URL handed to an HTTP client.
+    with pytest.raises(ValueError, match="Invalid did:web identifier"):
+        did_web_document_url(did)
+    with pytest.raises(ValueError, match="Invalid did:web"):
+        did_web_origin(did)
 
 
 def test_imported_status_is_used() -> None:

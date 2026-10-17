@@ -5,7 +5,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import MappingProxyType
-from typing import Generic, Protocol, TypeVar
+from typing import Generic, Protocol, TypeVar, runtime_checkable
 
 from agent_enrollment_protocol.core import (
     ApiKeyGrantResponse,
@@ -48,6 +48,11 @@ class IdentityProvider(Protocol):
     async def get_or_create_identity(self, request: IdentityRequest) -> ServiceIdentity: ...
 
     async def signer_for(self, identity: ServiceIdentity) -> AssertionSigner: ...
+
+
+@runtime_checkable
+class ExistingIdentityProvider(Protocol):
+    async def find_identity_by_service_did(self, service_did: str) -> ServiceIdentity | None: ...
 
 
 class IdentityStore(Protocol):
@@ -105,6 +110,9 @@ class InspectCacheEntry:
     cache_control: str = ""
     etag: str = ""
     last_modified: str = ""
+    age: str = ""
+    date: str = ""
+    expires: str = ""
 
 
 class InspectCache(Protocol):
@@ -188,6 +196,15 @@ class AuthenticationOptions:
     client_assertion_only: bool = False
     credential_id: str | None = None
     grant_type: str | None = None
+    allowed_methods: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.allowed_methods is not None:
+            object.__setattr__(self, "allowed_methods", tuple(self.allowed_methods))
+
+
+class CredentialUnavailableError(ValueError):
+    pass
 
 
 class AgentCommandError(Exception):

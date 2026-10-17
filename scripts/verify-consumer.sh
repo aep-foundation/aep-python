@@ -37,9 +37,11 @@ from agent_enrollment_protocol.adapters import AepAsgiApplication, AepAuthentica
 from agent_enrollment_protocol.agent import (
     Agent,
     AgentOptions,
+    FetchProtectedResourceOptions,
     HttpxTransport,
     PlatformIdentityProvider,
     ServiceIdentity,
+    fetch_protected_resource,
 )
 from agent_enrollment_protocol.core import (
     AEP_PLATFORM_WELL_KNOWN_PATH,
@@ -63,6 +65,8 @@ assert platform.__name__ == "agent_enrollment_protocol.platform"
 assert service.__name__ == "agent_enrollment_protocol.service"
 assert Agent.__module__ == "agent_enrollment_protocol.agent.client"
 assert AgentOptions.__module__ == "agent_enrollment_protocol.agent.client"
+assert FetchProtectedResourceOptions.__module__ == "agent_enrollment_protocol.agent.protected_resource"
+assert fetch_protected_resource.__module__ == "agent_enrollment_protocol.agent.protected_resource"
 assert HttpxTransport.__module__ == "agent_enrollment_protocol.agent.transport"
 assert PlatformIdentityProvider.__module__ == "agent_enrollment_protocol.agent.platform_provider"
 assert AEP_PLATFORM_WELL_KNOWN_PATH == "/.well-known/aep-platform"

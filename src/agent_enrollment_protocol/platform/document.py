@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import quote, urlsplit
 
@@ -22,6 +23,8 @@ HOSTED_IDENTITY_DRAFT = "draft-kavian-aep-platform-hosted-identity-01"
 WELL_KNOWN_PATH = AEP_PLATFORM_WELL_KNOWN_PATH
 _DID_CONTEXT = "https://www.w3.org/ns/did/v1"
 _DID_PLACEHOLDER = "{agent_did_id}"
+# RFC 7517 and RFC 7518 private key members, plus the symmetric key value.
+_PRIVATE_JWK_MEMBERS = frozenset({"d", "dp", "dq", "k", "oth", "p", "q", "qi"})
 
 
 def create_service_scoped_agent_did(host: str, path_prefix: str, agent_did_id: str) -> str:
@@ -54,6 +57,7 @@ def create_did_document(identity: IdentityRecord, method: DidVerificationMethod)
         or not method.public_key_jwk
     ):
         raise ValueError("AEP Platform DID verification method does not match the managed identity")
+    _require_public_jwk(method.public_key_jwk)
     return {
         "@context": [_DID_CONTEXT],
         "assertionMethod": [method.id],
@@ -152,6 +156,17 @@ def _validate_endpoint_path(name: str, path: str) -> None:
         or parsed.fragment
     ):
         raise ValueError(f"AEP Platform {name} endpoint must be an absolute path")
+
+
+def _require_public_jwk(jwk: Mapping[str, Any]) -> None:
+    """Refuses to publish anything but public verification material (PLT-DID-002).
+
+    A DID document is served to anyone who resolves the Agent DID. A key store that returns a JWK
+    still carrying its private members would publish the signing key itself, so the document is
+    never built from one.
+    """
+    if jwk.get("kty") == "oct" or _PRIVATE_JWK_MEMBERS & set(jwk):
+        raise ValueError("AEP Platform DID verification method must carry only public key material")
 
 
 def _encode_did_component(value: str) -> str:

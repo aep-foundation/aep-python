@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from itertools import count
 from typing import Any, cast
 
+import httpx
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from agent_enrollment_protocol.adapters import (
     AEP_PRINCIPAL_SCOPE_KEY,
@@ -16,8 +19,18 @@ from agent_enrollment_protocol.adapters import (
     AsgiScope,
     principal_from_scope,
 )
-from agent_enrollment_protocol.core import AEP_MEDIA_TYPE, AssertionOperation, GrantTypeConfig
+from agent_enrollment_protocol.core import (
+    AEP_MEDIA_TYPE,
+    AssertionOperation,
+    ClientAssertionClaims,
+    GrantTypeConfig,
+    SigningAlgorithm,
+    VerifyClientAssertionOptions,
+    sign_client_assertion,
+    verify_client_assertion,
+)
 from agent_enrollment_protocol.service import (
+    AssertionVerificationContext,
     AuthenticatedPrincipal,
     AuthenticationKind,
     CommandOptions,
@@ -25,10 +38,212 @@ from agent_enrollment_protocol.service import (
     GrantTypeDefinition,
     ProtectedResourceResult,
     Service,
+    ServiceOptions,
     ServiceResult,
 )
 
-from .test_service import AGENT_DID, Authenticator, GrantHandler, _assertion, _service
+from .test_service import (
+    AGENT_DID,
+    NOW,
+    SERVICE_DID,
+    Authenticator,
+    GrantHandler,
+    _assertion,
+    _service,
+)
+
+
+def signed_service(
+    endpoint_base: str = "/aep/",
+) -> tuple[Service, Callable[[AssertionOperation, str | None], str]]:
+    key = Ed25519PrivateKey.generate()
+    identifiers = count()
+
+    class Verifier:
+        async def verify(
+            self, assertion: str, context: AssertionVerificationContext
+        ) -> ClientAssertionClaims:
+            return verify_client_assertion(
+                assertion,
+                key=key.public_key(),
+                options=VerifyClientAssertionOptions(
+                    algorithms=context.algorithms,
+                    audience=context.service_did,
+                    operation=context.operation,
+                    resource=context.resource,
+                    current_time=int(context.current_time.timestamp()),
+                ),
+            )
+
+    def sign(operation: AssertionOperation, resource: str | None) -> str:
+        values: dict[str, object] = {
+            "aud": SERVICE_DID,
+            "iss": AGENT_DID,
+            "sub": AGENT_DID,
+            "iat": int(NOW.timestamp()),
+            "exp": int(NOW.timestamp()) + 60,
+            "jti": f"assertion-{next(identifiers)}",
+            "op": operation,
+        }
+        if resource is not None:
+            values["resource"] = resource
+        return sign_client_assertion(
+            ClientAssertionClaims.model_validate(values), key=key, algorithm=SigningAlgorithm.EDDSA
+        )
+
+    return Service(
+        ServiceOptions(
+            service_did=SERVICE_DID,
+            identity_methods=("did:web",),
+            verifier=Verifier(),
+            endpoint_base=endpoint_base,
+            authentication_methods=("aep-jwt",),
+            clock=lambda: NOW,
+            grant_types=(
+                GrantTypeDefinition(
+                    "api-key",
+                    GrantHandler(),
+                    config=GrantTypeConfig(supports_per_credential_revoke="true"),
+                ),
+            ),
+        )
+    ), sign
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "base",
+    [
+        "/aep/",
+        "/custom/aep/",
+        "/caf%C3%A9/aep/",
+        "/caf%65/aep/",
+        "/café/aep/",
+        "/literal%252F/aep/",
+        "/reserved%3F%23/aep/",
+    ],
+)
+async def test_asgi_routes_commands_at_the_advertised_encoded_base(base: str) -> None:
+    service, sign = signed_service(base)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=AepAsgiApplication(service)),
+        base_url="https://service.example",
+    ) as client:
+        inspect = (await client.get("/.well-known/aep")).json()
+        assert inspect["http"]["endpoint_base"] == base
+        for operation, body in (
+            (AssertionOperation.ENROLL, {"agent_did": AGENT_DID}),
+            (AssertionOperation.STATUS, None),
+            (AssertionOperation.GRANT, {"grant_type": "api-key"}),
+            (AssertionOperation.REVOKE, {"grant_type": "api-key", "credential_id": "credential-1"}),
+        ):
+            response = await client.request(
+                "GET" if operation is AssertionOperation.STATUS else "POST",
+                base + operation.value,
+                headers={
+                    "Authorization": "AEP " + sign(operation, None),
+                    "Idempotency-Key": "request-" + operation.value,
+                    "Content-Type": AEP_MEDIA_TYPE,
+                },
+                content=json.dumps(body).encode() if body is not None else None,
+            )
+            assert response.status_code == 200, response.text
+            assert response.headers["cache-control"] == "no-store"
+        if base == "/literal%252F/aep/":
+            wrong_path = await client.get("/literal%2F/aep/status")
+            assert wrong_path.status_code == 404
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("iterator", [False, True])
+async def test_authentication_preserves_raw_headers_and_streamed_body(iterator: bool) -> None:
+    service, sign = signed_service()
+    enrolled = await service.enroll(
+        json.dumps({"agent_did": AGENT_DID}).encode(),
+        CommandOptions(
+            client_assertion=sign(AssertionOperation.ENROLL, None), idempotency_key="enroll"
+        ),
+    )
+    assert enrolled.status == 200
+    resource = "https://service.example/caf%C3%A9?view=full"
+    headers = [
+        (b"AEP-Authorization", ("AEP " + sign(AssertionOperation.AUTHENTICATE, resource)).encode()),
+        (b"Authorization", b"Payment opaque-proof"),
+        (b"payment-signature", b"opaque-signature"),
+        (b"content-type", b"application/json"),
+        (b"x-repeat", b"first"),
+        (b"X-Repeat", b"second"),
+    ]
+    observed: list[tuple[bytes, bytes]] = []
+    bodies: list[bytes] = []
+
+    async def downstream(scope: AsgiScope, receive: Any, send: Any) -> None:
+        observed.extend(scope["headers"])
+        principal = principal_from_scope(scope)
+        assert principal is not None and principal.agent_did == AGENT_DID
+        while True:
+            message = await receive()
+            bodies.append(message["body"])
+            if not message.get("more_body", False):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    raw_headers = iter(iter(pair) for pair in headers) if iterator else headers
+    response = await invoke(
+        AepAuthenticationMiddleware(downstream, service, resource_origin="https://service.example"),
+        headers=raw_headers,
+        method="POST",
+        path="/café",
+        raw_path=b"/caf%C3%A9",
+        query_string=b"view=full",
+        messages=[
+            {"type": "http.request", "body": b'{"quantity":', "more_body": True},
+            {"type": "http.request", "body": b"2}"},
+        ],
+    )
+    assert response.status == 200
+    assert observed == headers
+    assert b"".join(bodies) == b'{"quantity":2}'
+    assert headers[1] == (b"Authorization", b"Payment opaque-proof")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("presentation", ["missing", "invalid", "duplicate", "wrong-resource"])
+async def test_single_use_headers_do_not_bypass_authentication(presentation: str) -> None:
+    service, sign = signed_service()
+    await service.enroll(
+        json.dumps({"agent_did": AGENT_DID}).encode(),
+        CommandOptions(
+            client_assertion=sign(AssertionOperation.ENROLL, None), idempotency_key="enroll"
+        ),
+    )
+    resource = (
+        "https://service.example/other"
+        if presentation == "wrong-resource"
+        else "https://service.example/private"
+    )
+    credential = ("AEP " + sign(AssertionOperation.AUTHENTICATE, resource)).encode()
+    headers = [(b"aep-authorization", credential)]
+    if presentation == "missing":
+        headers = []
+    elif presentation == "invalid":
+        headers = [(b"aep-authorization", b"malformed"), (b"authorization", credential)]
+    elif presentation == "duplicate":
+        headers *= 2
+
+    async def downstream(scope: AsgiScope, receive: Any, send: Any) -> None:
+        raise AssertionError("An unauthenticated request reached the application")
+
+    response = await invoke(
+        AepAuthenticationMiddleware(downstream, service, resource_origin="https://service.example"),
+        headers=iter(iter(pair) for pair in headers),
+        path="/private",
+    )
+    assert response.status == 401
+    expected = "authentication_required" if presentation == "missing" else "not_recognized"
+    assert json.loads(response.body)["code"] == expected
+    assert response.headers["cache-control"] == "no-store"
 
 
 @dataclass(frozen=True)
@@ -142,16 +357,36 @@ async def test_asgi_application_serves_and_revalidates_inspect() -> None:
     )
     assert wildcard.status == 304
 
+    # RFC 9110 section 15.5.5 answers an unsupported method with 405, and section 15.5.6 requires
+    # the Allow field to name the ones the resource does support.
     rejected = await invoke(application, method="POST", path="/.well-known/aep")
-    assert rejected.status == 400
-    assert rejected.headers["allow"] == "GET"
+    assert rejected.status == 405
+    assert rejected.headers["allow"] == "GET, HEAD"
     assert rejected.headers["content-type"] == "application/problem+json"
     assert json.loads(rejected.body) == {
         "code": "invalid_request",
-        "status": 400,
-        "title": "Invalid request",
+        "status": 405,
+        "title": "Method not allowed",
         "type": "urn:aep:error:invalid_request",
     }
+
+    # RFC 9110 section 9.1 requires HEAD wherever GET is supported, and section 9.3.2 keeps its
+    # header fields identical to the GET it stands in for, content aside.
+    served = await invoke(application, method="GET", path="/.well-known/aep")
+    head = await invoke(application, method="HEAD", path="/.well-known/aep")
+    assert head.status == served.status == 200
+    assert head.headers == served.headers
+    assert head.headers["content-length"] == str(len(served.body))
+    assert head.body == b""
+
+    conditional_head = await invoke(
+        application,
+        method="HEAD",
+        path="/.well-known/aep",
+        headers=[(b"if-none-match", served.headers["etag"].encode())],
+    )
+    assert conditional_head.status == 304
+    assert conditional_head.body == b""
 
 
 @pytest.mark.asyncio
@@ -267,8 +502,18 @@ async def test_asgi_application_rejects_invalid_command_requests() -> None:
     application = AepAsgiApplication(service, maximum_request_body_bytes=4)
 
     wrong_method = await invoke(application, method="GET", path="/aep/enroll")
-    assert wrong_method.status == 400
+    assert wrong_method.status == 405
     assert wrong_method.headers["allow"] == "POST"
+
+    # Status is safe, so it answers HEAD as well as GET and names both in Allow.
+    status_head = await invoke(application, method="HEAD", path="/aep/status")
+    status_get = await invoke(application, method="GET", path="/aep/status")
+    assert status_head.status == status_get.status
+    assert status_head.headers == status_get.headers
+    assert status_head.body == b""
+    status_method = await invoke(application, method="POST", path="/aep/status")
+    assert status_method.status == 405
+    assert status_method.headers["allow"] == "GET, HEAD"
 
     for headers in (
         [],
@@ -294,8 +539,11 @@ async def test_asgi_application_rejects_invalid_command_requests() -> None:
         method="POST",
         path="/aep/enroll",
     )
-    assert large.status == 400
+    # RFC 9110 section 15.5.14: a body over the configured limit is 413, which tells the caller not
+    # to retry it unchanged, rather than 400 claiming the request itself was malformed.
+    assert large.status == 413
     assert json.loads(large.body)["code"] == "invalid_request"
+    assert json.loads(large.body)["title"] == "Content too large"
 
     disconnected = await invoke(
         application,

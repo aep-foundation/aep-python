@@ -27,11 +27,13 @@ from agent_enrollment_protocol.agent import (
     AssertionSigner,
     AuthenticationOptions,
     EnrollOptions,
+    FetchProtectedResourceOptions,
     GrantOptions,
     HttpxTransport,
     IdentityRequest,
     RevokeOptions,
     ServiceIdentity,
+    fetch_protected_resource,
 )
 from agent_enrollment_protocol.core import (
     AEP_AUTHENTICATION_METHOD_JWT,
@@ -42,12 +44,14 @@ from agent_enrollment_protocol.core import (
     AEP_GRANT_TYPE_OAUTH_BEARER,
     AEP_IDENTITY_METHOD_DID_WEB,
     AepAssertionError,
+    AgentStatus,
     ApiKeyGrantResponse,
     BasicGrantResponse,
     ClaimValues,
     ClientAssertionClaims,
     GrantRequest,
     GrantTypeConfig,
+    HttpRequest,
     InspectClaims,
     OAuthBearerGrantResponse,
     SigningAlgorithm,
@@ -191,6 +195,8 @@ async def main() -> None:
     key = Ed25519PrivateKey.generate()
     credential_store = MemoryServiceCredentialStore()
 
+    # The demo grants read-only account access. Requested scopes are not permission to issue
+    # arbitrary privileges; a real issuer applies its own account and authorization policy.
     async def issue_api_key(request: GrantRequest, context: GrantContext) -> ApiKeyGrantResponse:
         return ApiKeyGrantResponse(
             api_key=secrets.token_urlsafe(24),
@@ -199,7 +205,7 @@ async def main() -> None:
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
             header="X-Agent-Key",
-            scopes=request.requested_scopes,
+            scopes=("account:read",),
         )
 
     async def issue_basic(request: GrantRequest, context: GrantContext) -> BasicGrantResponse:
@@ -209,7 +215,7 @@ async def main() -> None:
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
             password=secrets.token_urlsafe(24),
-            scopes=request.requested_scopes,
+            scopes=("account:read",),
             username="example-agent",
         )
 
@@ -220,7 +226,7 @@ async def main() -> None:
             expires_at=(context.current_time + timedelta(hours=1))
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"),
-            scopes=request.requested_scopes,
+            scopes=("account:read",),
             token_type="Bearer",
         )
 
@@ -305,7 +311,36 @@ async def main() -> None:
                     )
                 )
             )
+            if enrollment.body.status is not AgentStatus.ACTIVE:
+                raise RuntimeError("The example enrollment did not become active")
             print("Enroll:", enrollment.body.status.value)
+
+            status = await session.status()
+            if status.body.status is not AgentStatus.ACTIVE:
+                raise RuntimeError("The Service did not report an active Agent")
+            print("Status:", status.body.status.value)
+
+            # With no stored session credential, the advertised JWT method signs this resource
+            # request. The helper follows the challenge but does not enroll for the caller.
+            authenticated = await fetch_protected_resource(
+                FetchProtectedResourceOptions(
+                    agent=agent,
+                    request=HttpRequest(method="GET", url=RESOURCE),
+                    carrier="AEP-Authorization",
+                    transport=transport,
+                )
+            )
+            if authenticated.status != 200:
+                raise RuntimeError("The JWT-authenticated resource request failed")
+            jwt_resource = json.loads(authenticated.body)
+            if (
+                jwt_resource["agent_did"] != AGENT_DID
+                or jwt_resource["authentication_method"] != AEP_AUTHENTICATION_METHOD_JWT
+            ):
+                raise RuntimeError(
+                    "The resource did not authenticate the expected Agent and method"
+                )
+            print("Resource:", jwt_resource["message"], "(aep-jwt)")
 
             for grant_type in (
                 AEP_GRANT_TYPE_API_KEY,
@@ -329,6 +364,11 @@ async def main() -> None:
                 response = await client.get(RESOURCE, headers=headers)
                 response.raise_for_status()
                 resource: dict[str, Any] = response.json()
+                if (
+                    resource["agent_did"] != AGENT_DID
+                    or resource["authentication_method"] != grant_type
+                ):
+                    raise RuntimeError("The resource did not use the selected credential")
                 print(
                     "Resource:",
                     resource["message"],

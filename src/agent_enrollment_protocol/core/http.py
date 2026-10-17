@@ -15,6 +15,14 @@ from .models import (
     ProtectedResourceAuthorization,
 )
 
+_CREDENTIALS_PATTERN = re.compile(r"\A[\x21-\x7e]+\Z")
+# CORE-AUTH-001 spells the presentation as `"AEP" 1*SP compact-jws`, so repeated separators belong
+# to the grammar, a field value may carry trailing optional whitespace, and the credential itself is
+# visible US-ASCII with no space. Requiring a single separator rejected a conforming presentation,
+# and allowing a space inside the credential let one field value carry two of them.
+_AUTHORIZATION_PATTERN = re.compile(
+    r"\A(AEP|Bearer|Basic)[ \t]+([\x21-\x7e]+)[ \t]*\Z", re.IGNORECASE
+)
 _TOKEN = r"[!#$%&'*+.^_`|~0-9A-Za-z-]+"
 _QUOTED_STRING = r'"(?:[\t !#-\[\]-~\x80-\xff]|\\[\t !-~\x80-\xff])*"'
 _MEDIA_TYPE_PATTERN = re.compile(
@@ -52,9 +60,23 @@ def media_type_essence(value: str) -> str:
 
 
 def normalize_endpoint_base(endpoint_base: str = DEFAULT_HTTP_ENDPOINT_BASE) -> str:
-    if not endpoint_base.startswith("/") or endpoint_base.startswith("//"):
+    if not is_endpoint_path(endpoint_base):
         raise ValueError("AEP endpoint_base must be an origin-relative absolute path")
     return endpoint_base if endpoint_base.endswith("/") else f"{endpoint_base}/"
+
+
+def is_endpoint_path(value: str) -> bool:
+    """Reports whether a value can carry a command path appended to it.
+
+    CORE-HTTP-004 builds a command URL by appending the relative path with exactly one `/`
+    separator. A base carrying a query, a fragment, or a dot segment cannot satisfy that: the
+    command name would land in the query string or walk out of the advertised base.
+    """
+    if not value.startswith("/") or value.startswith("//"):
+        return False
+    if "?" in value or "#" in value:
+        return False
+    return not any(segment in {".", ".."} for segment in value.split("/"))
 
 
 def command_path(command: Command, endpoint_base: str = DEFAULT_HTTP_ENDPOINT_BASE) -> str:
@@ -72,6 +94,13 @@ def render_authorization(value: ProtectedResourceAuthorization) -> tuple[str, st
         raise AepAuthorizationError(
             "Authorization credentials must not be empty.", "invalid_request"
         )
+    # Visible US-ASCII excluding space keeps CR, LF, NUL, and other control characters out of a
+    # rendered field value, and keeps one field value from carrying two credentials.
+    if _CREDENTIALS_PATTERN.fullmatch(value.credentials) is None:
+        raise AepAuthorizationError(
+            "Authorization credentials must not contain whitespace or control characters.",
+            "invalid_request",
+        )
     return value.carrier.value, f"{value.scheme.value} {value.credentials}"
 
 
@@ -82,17 +111,16 @@ def parse_authorization(
         raise AepAuthorizationError(
             "The dedicated authorization field is ambiguous.", "not_recognized"
         )
-    scheme_text, separator, credentials = value.partition(" ")
-    schemes = {item.value.lower(): item for item in AuthorizationScheme}
-    scheme = schemes.get(scheme_text.lower())
-    if not separator or scheme is None or not credentials or credentials[0].isspace():
+    match = _AUTHORIZATION_PATTERN.fullmatch(value)
+    if match is None:
         raise AepAuthorizationError(
             "The authorization presentation was not recognized.", "not_recognized"
         )
+    schemes = {item.value.lower(): item for item in AuthorizationScheme}
     return ProtectedResourceAuthorization(
         carrier=carrier,
-        credentials=credentials,
-        scheme=scheme,
+        credentials=match.group(2),
+        scheme=schemes[match.group(1).lower()],
     )
 
 

@@ -1,18 +1,82 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
+from enum import StrEnum
 from urllib.parse import urljoin, urlsplit
 
 from .models import OpenApiTrailingSlash
 
 _PATH_EXPRESSION = re.compile(r"\{[^{}]+\}")
 
+SecurityRequirements = Sequence[Mapping[str, Sequence[str]]]
+
 
 @dataclass(frozen=True, slots=True)
 class OpenApiPathMatch:
     method: str
     template: str
+
+
+class OpenApiSecurityDisposition(StrEnum):
+    """How an Agent must treat the security an operation resolves to."""
+
+    PUBLIC = "public"
+    OPTIONAL_ANONYMOUS = "optional-anonymous"
+    REQUIRED = "required"
+    ALTERNATIVES = "alternatives"
+    ALL_REQUIRED = "all-required"
+    FALLBACK_LIVE_CHALLENGE = "fallback-live-challenge"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenApiSecurityResolution:
+    """The resolved security for one operation.
+
+    `satisfiable` lists the complete requirement objects the Agent can satisfy, each as the scheme
+    names it must present together. It is empty unless the disposition selects credentials.
+    """
+
+    disposition: OpenApiSecurityDisposition
+    satisfiable: tuple[tuple[str, ...], ...] = ()
+
+
+def resolve_openapi_security(
+    *,
+    root: SecurityRequirements | None,
+    operation: SecurityRequirements | None,
+    supported_schemes: Collection[str],
+) -> OpenApiSecurityResolution:
+    """Resolves the effective security for one operation (CORE-OAS-011/013/014/015).
+
+    Operation-level security replaces the root value rather than adding to it, an empty list makes
+    the operation public, an empty requirement object is an anonymous alternative, several
+    requirement objects are alternatives, and several schemes inside one object are compound. An
+    Agent that cannot satisfy every member of a compound requirement treats that requirement as
+    unsupported and never reduces it to the members it does support, so the requirements reported
+    as satisfiable are always whole requirement objects.
+    """
+    supported = frozenset(supported_schemes)
+    effective = operation if operation is not None else (root if root is not None else ())
+    if not effective:
+        return OpenApiSecurityResolution(OpenApiSecurityDisposition.PUBLIC)
+    requirements = tuple(tuple(requirement) for requirement in effective)
+    if any(not requirement for requirement in requirements):
+        return OpenApiSecurityResolution(OpenApiSecurityDisposition.OPTIONAL_ANONYMOUS)
+    satisfiable = tuple(
+        requirement for requirement in requirements if supported.issuperset(requirement)
+    )
+    if not satisfiable:
+        return OpenApiSecurityResolution(OpenApiSecurityDisposition.FALLBACK_LIVE_CHALLENGE)
+    if len(requirements) > 1:
+        return OpenApiSecurityResolution(OpenApiSecurityDisposition.ALTERNATIVES, satisfiable)
+    disposition = (
+        OpenApiSecurityDisposition.ALL_REQUIRED
+        if len(satisfiable[0]) > 1
+        else OpenApiSecurityDisposition.REQUIRED
+    )
+    return OpenApiSecurityResolution(disposition, satisfiable)
 
 
 def match_openapi_path(

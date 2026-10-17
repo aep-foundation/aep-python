@@ -5,7 +5,7 @@ import ipaddress
 import json
 from collections.abc import Awaitable, Callable, Iterable, Mapping, MutableMapping, Sequence
 from typing import Any, Protocol
-from urllib.parse import quote, quote_from_bytes, urlsplit, urlunsplit
+from urllib.parse import quote, quote_from_bytes, unquote, urlsplit, urlunsplit
 
 from pydantic import BaseModel
 
@@ -37,6 +37,11 @@ AsgiSend = Callable[[AsgiMessage], Awaitable[None]]
 DEFAULT_INSPECT_CACHE_CONTROL = "public, max-age=300"
 DEFAULT_MAXIMUM_REQUEST_BODY_BYTES = 1 << 20
 AEP_PRINCIPAL_SCOPE_KEY = "aep.principal"
+# RFC 9110 section 9.1 requires every general-purpose server to support GET and HEAD, and section
+# 9.3.2 makes HEAD identical to GET apart from the content. A resource that answers GET answers
+# HEAD as well, so allowing only GET turned every cache revalidation and link check into a refusal.
+_SAFE_METHODS = ("GET", "HEAD")
+_SAFE_ALLOW = ", ".join(_SAFE_METHODS)
 _HTTP_TOKEN_CHARACTERS = frozenset(
     "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
@@ -84,7 +89,7 @@ class AepAsgiApplication:
         inspect_body = _json_bytes(document.to_wire())
         self._application = application if application is not None else _default_application
         self._command_paths = {
-            command_path_from_inspect(document, command): command
+            unquote(command_path_from_inspect(document, command)): command
             for command in Command
             if command is not Command.INSPECT and command.value in document.commands.supported
         }
@@ -111,17 +116,21 @@ class AepAsgiApplication:
         await self._serve_command(scope, receive, send, command)
 
     async def _serve_inspect(self, scope: AsgiScope, send: AsgiSend) -> None:
-        if scope.get("method") != "GET":
+        method = scope.get("method")
+        if method not in _SAFE_METHODS:
+            # RFC 9110 section 15.5.5: a method the target resource does not support is 405, and
+            # section 15.5.6 requires the Allow field naming the ones it does.
             await _send_problem(
                 send,
-                400,
-                "Invalid request",
+                405,
+                "Method not allowed",
                 code="invalid_request",
-                headers={"Allow": "GET"},
+                headers={"Allow": _SAFE_ALLOW},
             )
             return
 
-        headers = _request_headers(scope)
+        head = method == "HEAD"
+        headers = _request_headers(_raw_headers(scope))
         if _etag_matches(headers.get("if-none-match"), self._inspect_etag):
             await _send_response(
                 send,
@@ -142,6 +151,7 @@ class AepAsgiApplication:
                 "Content-Type": AEP_MEDIA_TYPE,
                 "ETag": self._inspect_etag,
             },
+            head=head,
         )
 
     async def _serve_command(
@@ -151,22 +161,25 @@ class AepAsgiApplication:
         send: AsgiSend,
         command: Command,
     ) -> None:
-        expected_method = "GET" if command is Command.STATUS else "POST"
-        if scope.get("method") != expected_method:
+        safe = command is Command.STATUS
+        method = scope.get("method")
+        allowed = _SAFE_METHODS if safe else ("POST",)
+        if method not in allowed:
             await _send_problem(
                 send,
-                400,
-                "Invalid request",
+                405,
+                "Method not allowed",
                 code="invalid_request",
-                headers={"Allow": expected_method},
+                headers={"Allow": _SAFE_ALLOW if safe else "POST"},
             )
             return
 
-        headers = _request_headers(scope)
+        head = method == "HEAD"
+        headers = _request_headers(_raw_headers(scope))
         assertion = _command_assertion(headers.get("authorization"))
         if command is Command.STATUS:
             status_result = await self._service.status(CommandOptions(client_assertion=assertion))
-            await _send_service_result(send, status_result)
+            await _send_service_result(send, status_result, head=head)
             return
 
         if not _single_media_type(headers.get("content-type"), AEP_MEDIA_TYPE):
@@ -177,7 +190,9 @@ class AepAsgiApplication:
         except _RequestDisconnected:
             return
         if body is None:
-            await _send_problem(send, 400, "Invalid request", code="invalid_request")
+            # RFC 9110 section 15.5.14: a body over the configured limit is 413, which tells the
+            # caller not to retry it unchanged. 400 claimed the request was malformed instead.
+            await _send_problem(send, 413, "Content too large", code="invalid_request")
             return
         options = CommandOptions(
             client_assertion=assertion,
@@ -215,9 +230,10 @@ class AepAuthenticationMiddleware:
             await self._application(scope, receive, send)
             return
 
+        raw_headers = _raw_headers(scope)
         result = await self._service.authenticate_protected_resource(
             ProtectedResourceRequest(
-                headers=_request_headers(scope),
+                headers=_request_headers(raw_headers),
                 method=_scope_text(scope, "method"),
                 url=_resource_url(self._resource_origin, scope),
             )
@@ -230,6 +246,7 @@ class AepAuthenticationMiddleware:
         if result.principal is None:
             raise RuntimeError("AEP Service returned an authenticated result without a principal")
         authenticated_scope = dict(scope)
+        authenticated_scope["headers"] = raw_headers
         authenticated_scope[AEP_PRINCIPAL_SCOPE_KEY] = result.principal
         await self._application(authenticated_scope, receive, send)
 
@@ -276,7 +293,9 @@ async def _read_body(receive: AsgiReceive, maximum: int) -> bytes | None:
             return bytes(body)
 
 
-async def _send_service_result(send: AsgiSend, result: ServiceResult[Any]) -> None:
+async def _send_service_result(
+    send: AsgiSend, result: ServiceResult[Any], *, head: bool = False
+) -> None:
     value: object = result.problem if result.problem is not None else result.body
     if isinstance(value, BaseModel):
         value = value.model_dump(by_alias=True, exclude_none=True, mode="json")
@@ -284,7 +303,7 @@ async def _send_service_result(send: AsgiSend, result: ServiceResult[Any]) -> No
     headers = dict(result.headers)
     headers["Cache-Control"] = "no-store"
     headers["Content-Type"] = result.content_type
-    await _send_response(send, result.status, body, headers)
+    await _send_response(send, result.status, body, headers, head=head)
 
 
 async def _send_problem(
@@ -313,7 +332,15 @@ async def _send_response(
     status: int,
     body: bytes,
     headers: Mapping[str, str],
+    *,
+    head: bool = False,
 ) -> None:
+    """Sends one response, omitting the content when the request method was HEAD.
+
+    RFC 9110 section 9.3.2 keeps the header fields a HEAD response carries identical to the GET
+    it stands in for, including an accurate Content-Length, so a caller sizing a resource or
+    revalidating a cached copy reads the same metadata either way.
+    """
     values = {
         name.lower(): value for name, value in headers.items() if name.lower() != "content-length"
     }
@@ -331,14 +358,14 @@ async def _send_response(
             raise ValueError("AEP ASGI response contains an invalid HTTP field")
         encoded.append((name.encode("ascii"), value.encode("latin-1")))
     await send({"type": "http.response.start", "status": status, "headers": encoded})
-    await send({"type": "http.response.body", "body": body})
+    await send({"type": "http.response.body", "body": b"" if head else body})
 
 
-def _request_headers(scope: Mapping[str, Any]) -> Mapping[str, str | Sequence[str]]:
-    grouped: dict[str, list[str]] = {}
+def _raw_headers(scope: Mapping[str, Any]) -> tuple[tuple[bytes, bytes], ...]:
     raw_headers = scope.get("headers", ())
     if not isinstance(raw_headers, Iterable):
         raise RuntimeError("AEP ASGI request headers must be iterable")
+    pairs: list[tuple[bytes, bytes]] = []
     for item in raw_headers:
         if not isinstance(item, Iterable):
             raise RuntimeError("AEP ASGI request header entries must be pairs")
@@ -348,6 +375,15 @@ def _request_headers(scope: Mapping[str, Any]) -> Mapping[str, str | Sequence[st
             raise RuntimeError("AEP ASGI request header entries must be pairs") from error
         if not isinstance(raw_name, bytes) or not isinstance(raw_value, bytes):
             raise RuntimeError("AEP ASGI request headers must contain bytes")
+        pairs.append((raw_name, raw_value))
+    return tuple(pairs)
+
+
+def _request_headers(
+    raw_headers: Sequence[tuple[bytes, bytes]],
+) -> Mapping[str, str | Sequence[str]]:
+    grouped: dict[str, list[str]] = {}
+    for raw_name, raw_value in raw_headers:
         name = raw_name.decode("latin-1").lower()
         grouped.setdefault(name, []).append(raw_value.decode("latin-1"))
     return {

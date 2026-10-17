@@ -3,10 +3,10 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from datetime import date, datetime
-from email.errors import HeaderParseError
-from email.headerregistry import Address
 from enum import StrEnum
+from ipaddress import IPv6Address
 from typing import Annotated, Any, ClassVar, Literal, Self
+from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
     BaseModel,
@@ -31,8 +31,8 @@ HTTP_FIELD_NAME_PATTERN = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 NON_NEGATIVE_INTEGER_PATTERN = re.compile(r"^(?:0|[1-9][0-9]*)$")
 POSITIVE_SECONDS_PATTERN = re.compile(r"^(?:[1-9]|[1-9][0-9]|[12][0-9]{2}|300)$")
 RFC3339_DATETIME_PATTERN = re.compile(
-    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
-    r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    r"^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]+)?(?:[Zz]|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])$"
 )
 RFC3339_FULL_DATE_PATTERN = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 URI_SCHEME_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*$")
@@ -116,11 +116,21 @@ class AepModel(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def reject_explicit_null(cls, value: Any) -> Any:
+    def reject_explicit_null(cls, value: Any, info: ValidationInfo) -> Any:
         if isinstance(value, dict):
-            known_fields = {field.alias or name for name, field in cls.model_fields.items()}
+            known_fields = {
+                key: field.alias or name
+                for name, field in cls.model_fields.items()
+                for key in (
+                    (name, field.alias or name) if info.mode == "python" else (field.alias or name,)
+                )
+            }
             for field, member in value.items():
-                if member is None and field in known_fields and field not in cls.nullable_fields:
+                if (
+                    member is None
+                    and field in known_fields
+                    and known_fields[field] not in cls.nullable_fields
+                ):
                     raise ValueError(f"{field} must be omitted instead of null")
             return deepcopy(value)
         return value
@@ -247,9 +257,10 @@ class HttpConfiguration(AepModel):
 
     @model_validator(mode="after")
     def validate_endpoint_base(self) -> Self:
-        if self.endpoint_base is not None and (
-            not self.endpoint_base.startswith("/") or self.endpoint_base.startswith("//")
-        ):
+        # CORE-HTTP-004 appends the command path to this value with one `/` separator, so a base
+        # carrying a query, a fragment, or a dot segment would steer every command URL away from
+        # the advertised base.
+        if self.endpoint_base is not None and not _is_endpoint_path(self.endpoint_base):
             raise ValueError("endpoint_base must be an origin-relative absolute path")
         return self
 
@@ -336,6 +347,13 @@ class ClaimValues(AepModel):
 
     @model_validator(mode="after")
     def validate_claims(self) -> Self:
+        # Extra wire keys can match Python field names. Pydantic includes them in fields_set,
+        # which would serialize an unprovided registered claim as null with exclude_unset.
+        self.model_fields_set.difference_update(
+            name
+            for name in (self.model_extra or {})
+            if name in type(self).model_fields and getattr(self, name) is None
+        )
         non_empty = (
             self.person_first_name,
             self.person_last_name,
@@ -591,7 +609,7 @@ class PlatformEndpoints(AepModel):
             self.list,
             self.hosted_verification,
         ):
-            if value is not None and (not value.startswith("/") or value.startswith("//")):
+            if value is not None and not _is_endpoint_path(value):
                 raise ValueError("Platform endpoint paths must be origin-relative absolute paths")
         if self.lifecycle.count("{agent_identity_id}") != 1:
             raise ValueError("lifecycle must contain one {agent_identity_id} placeholder")
@@ -609,11 +627,7 @@ class PlatformHttp(AepModel):
 
     @model_validator(mode="after")
     def validate_endpoint_base(self) -> Self:
-        if (
-            not self.endpoint_base.startswith("/")
-            or self.endpoint_base.startswith("//")
-            or "{" in self.endpoint_base
-        ):
+        if not _is_endpoint_path(self.endpoint_base) or "{" in self.endpoint_base:
             raise ValueError("endpoint_base must be an origin-relative absolute path")
         return self
 
@@ -836,13 +850,21 @@ class PlatformVerificationResponse(AepModel):
 def parse_rfc3339(value: str) -> datetime:
     if RFC3339_DATETIME_PATTERN.fullmatch(value) is None:
         raise ValueError("invalid RFC 3339 date-time")
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return datetime.fromisoformat(value.upper().replace("Z", "+00:00"))
 
 
 def parse_full_date(value: str) -> date:
     if RFC3339_FULL_DATE_PATTERN.fullmatch(value) is None:
         raise ValueError("invalid RFC 3339 full-date")
     return date.fromisoformat(value)
+
+
+def _is_endpoint_path(value: str) -> bool:
+    if not value.startswith("/") or value.startswith("//"):
+        return False
+    if "?" in value or "#" in value:
+        return False
+    return not any(segment in {".", ".."} for segment in value.split("/"))
 
 
 def _require_identifiers(values: tuple[str, ...], name: str, *, unique: bool = False) -> None:
@@ -865,16 +887,18 @@ def _require_did(value: str, name: str) -> None:
 
 
 def _require_https_uri(value: str, name: str) -> None:
-    from urllib.parse import urlsplit
-
     parsed = urlsplit(value)
-    if parsed.scheme != "https" or not parsed.hostname or parsed.fragment:
-        raise ValueError(f"{name} must be an absolute HTTPS URI without a fragment")
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or "#" in value
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError(f"{name} must be an absolute HTTPS URI without a fragment or user info")
 
 
 def _require_resource_uri(value: str, name: str, *, allow_insecure_loopback: bool = False) -> None:
-    from urllib.parse import urlsplit
-
     parsed = urlsplit(value)
     secure = parsed.scheme == "https"
     loopback = (
@@ -882,8 +906,31 @@ def _require_resource_uri(value: str, name: str, *, allow_insecure_loopback: boo
         and parsed.scheme == "http"
         and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
     )
-    if (not secure and not loopback) or not parsed.hostname or parsed.fragment:
-        raise ValueError(f"{name} must be an absolute HTTPS URI without a fragment")
+    # User information in a resource URL carries credentials the assertion is not bound to and
+    # makes the authority ambiguous to a reader, so it is refused here as it is on every other
+    # URL this package accepts.
+    if (
+        (not secure and not loopback)
+        or not parsed.hostname
+        or "#" in value
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError(f"{name} must be an absolute HTTPS URI without a fragment or user info")
+
+
+def _normalize_resource_uri(value: str, *, allow_insecure_loopback: bool = False) -> str:
+    _require_resource_uri(value, "resource", allow_insecure_loopback=allow_insecure_loopback)
+    parsed = urlsplit(value)
+    host = parsed.hostname or ""
+    authority = f"[{host}]" if ":" in host else host
+    if parsed.port is not None and parsed.port != (443 if parsed.scheme == "https" else 80):
+        authority += f":{parsed.port}"
+    normalized = urlunsplit((parsed.scheme, authority, parsed.path or "/", parsed.query, ""))
+    # An empty query is not interchangeable with an absent query.
+    if "?" in value and not parsed.query:
+        normalized += "?"
+    return normalized
 
 
 def _validate_operation_resource(op: AssertionOperation, resource: str | None) -> None:
@@ -896,26 +943,44 @@ def _validate_operation_resource(op: AssertionOperation, resource: str | None) -
 
 
 def _is_mailbox(value: str) -> bool:
-    if len(value.encode()) > 320 or "@" not in value:
+    if not value.isascii() or len(value.encode()) > 320 or "@" not in value:
         return False
-    try:
-        address = Address(addr_spec=value)
-    except (HeaderParseError, IndexError, ValueError):
-        return False
-    local, separator, domain = address.addr_spec.rpartition("@")
+    local, separator, domain = value.rpartition("@")
     if not separator or len(local.encode()) > 64 or len(domain.encode()) > 255:
         return False
-    if "." not in local and local.startswith('"'):
-        return True
+    if (
+        re.fullmatch(
+            r"""(?:[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+(?:\.[A-Za-z0-9!#$%&'*+/=?^_`{|}~-]+)*"""
+            r"""|"(?:[\x20-\x21\x23-\x5b\x5d-\x7e]|\\[\x20-\x7e])*")""",
+            local,
+        )
+        is None
+    ):
+        return False
+    if domain.startswith("[") and domain.endswith("]"):
+        literal = domain[1:-1]
+        if re.fullmatch(r"[0-9]{1,3}(?:\.[0-9]{1,3}){3}", literal):
+            return all(int(octet) <= 255 for octet in literal.split("."))
+        if literal[:5].lower() == "ipv6:":
+            try:
+                IPv6Address(literal[5:])
+            except ValueError:
+                return False
+            return "%" not in literal
+        return re.fullmatch(r"[A-Za-z0-9-]*[A-Za-z0-9]:[\x21-\x5a\x5e-\x7e]+", literal) is not None
     labels = domain.split(".")
     return all(
         label
         and len(label) <= 63
-        and label[0].isalnum()
-        and label[-1].isalnum()
-        and all(character.isalnum() or character == "-" for character in label)
+        and _is_ascii_alphanumeric(label[0])
+        and _is_ascii_alphanumeric(label[-1])
+        and all(_is_ascii_alphanumeric(character) or character == "-" for character in label)
         for label in labels
     )
+
+
+def _is_ascii_alphanumeric(value: str) -> bool:
+    return value.isascii() and value.isalnum()
 
 
 def _is_absolute_uri(value: str) -> bool:

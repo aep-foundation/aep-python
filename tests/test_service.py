@@ -360,6 +360,42 @@ async def test_memory_stores_are_atomic_and_expire() -> None:
         await naive.execute(value, operation)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("header", "value", "code"),
+    [
+        ("Authorization", "AEP", "not_recognized"),
+        ("Authorization", "Bearer", "not_recognized"),
+        ("Authorization", "AEP not a token", "not_recognized"),
+        ("Authorization", "basic  ", "not_recognized"),
+        ("Authorization", "Negotiate abc", "authentication_required"),
+        ("X-Other", "value", "authentication_required"),
+    ],
+)
+async def test_malformed_presentation_is_distinguished_from_a_missing_one(
+    header: str, value: str, code: str
+) -> None:
+    # CORE-PR-038: missing credentials answer authentication_required, while malformed ones answer
+    # not_recognized. A value naming an AEP scheme is an AEP presentation even when the rest of it
+    # does not parse; a value naming another protocol's scheme is not ours to reject.
+    service, _ = _service()
+    await service.enroll(
+        json.dumps({"agent_did": AGENT_DID}).encode(),
+        _options(AssertionOperation.ENROLL, "enroll-malformed", key="enroll-malformed"),
+    )
+
+    result = await service.authenticate_protected_resource(
+        ProtectedResourceRequest(
+            headers={header: value}, method="GET", url="https://service.example/orders"
+        )
+    )
+
+    assert not result.authenticated
+    assert result.response is not None
+    assert result.response.problem is not None
+    assert result.response.problem.code == code
+
+
 def _record() -> EnrollmentRecord:
     return EnrollmentRecord(
         agent_did=AGENT_DID,

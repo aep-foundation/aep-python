@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
+import hashlib
+import hmac
+import threading
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, cast
@@ -39,6 +43,136 @@ async def _active_store() -> MemoryEnrollmentStore:
     store = MemoryEnrollmentStore()
     await store.save(_record())
     return store
+
+
+@pytest.mark.asyncio
+async def test_public_grant_configuration_cannot_mutate_private_issuance() -> None:
+    store = MemoryServiceCredentialStore()
+    header = ["X-Key"]
+
+    async def issue(request: GrantRequest, context: GrantContext) -> ApiKeyGrantResponse:
+        return ApiKeyGrantResponse(
+            api_key="secret", credential_id="one", expires_at=EXPIRES, header=header[0]
+        )
+
+    definition = stored_api_key_grant_type(
+        StoredCredentialGrantTypeOptions(
+            issue=issue,
+            store=store,
+            config=GrantTypeConfig.model_validate({"header_names": ["x-key"]}),
+        )
+    )
+    service, _ = _service(grant_types=(definition,), enrollment_store=await _active_store())
+    assert definition.config.model_extra is not None
+    definition.config.model_extra["header_names"].append("x-other")
+    header[0] = "X-Other"
+    with pytest.raises(ValueError, match="not advertised"):
+        await service.grant(
+            b'{"grant_type":"api-key"}',
+            _options(AssertionOperation.GRANT, "bad-config", key="bad-config"),
+        )
+    assert store._records == {}
+    configs = service.inspect_document.commands.grant_types_config
+    assert configs is not None
+    assert configs["api-key"].to_wire()["header_names"] == ["x-key"]
+    header[0] = "X-Key"
+    assert (
+        await service.grant(
+            b'{"grant_type":"api-key"}',
+            _options(AssertionOperation.GRANT, "good-config", key="good-config"),
+        )
+    ).status == 200
+
+
+@pytest.mark.asyncio
+async def test_stored_credential_expiry_uses_core_rfc3339_rules() -> None:
+    store = MemoryServiceCredentialStore()
+
+    async def issue(request: GrantRequest, context: GrantContext) -> ApiKeyGrantResponse:
+        return ApiKeyGrantResponse(
+            api_key="secret", credential_id="lowercase", expires_at=EXPIRES.lower(), header="X-Key"
+        )
+
+    definition = stored_api_key_grant_type(
+        StoredCredentialGrantTypeOptions(issue=issue, store=store)
+    )
+    service, _ = _service(
+        grant_types=(definition,),
+        authentication_methods=("api-key",),
+        enrollment_store=await _active_store(),
+    )
+    result = await service.grant(
+        b'{"grant_type":"api-key"}',
+        _options(AssertionOperation.GRANT, "lowercase", key="lowercase"),
+    )
+    assert result.status == 200
+    assert (
+        await service.authenticate_protected_resource(
+            ProtectedResourceRequest(headers={"X-Key": "secret"}, method="GET", url=RESOURCE)
+        )
+    ).authenticated
+
+
+@pytest.mark.asyncio
+async def test_memory_password_verifier_has_unique_salt_and_preserves_store_contract() -> None:
+    credential = BasicGrantResponse(
+        username="agent", password="password-secret", credential_id="basic-one", expires_at=EXPIRES
+    )
+    record = ServiceCredentialRecord(
+        AGENT_DID, NOW, credential, credential.credential_id, NOW + timedelta(hours=1), "basic"
+    )
+    first, second = MemoryServiceCredentialStore(), MemoryServiceCredentialStore()
+    await first.save_credential(record)
+    await second.save_credential(record)
+    stored = first._records[record.credential_id]
+    other = second._records[record.credential_id]
+    presented = base64.b64encode(b"agent:password-secret").decode()
+    assert len(stored.salt) == 16 and stored.salt != other.salt
+    assert stored.verifier != other.verifier
+    assert stored.verifier != hashlib.sha256(presented.encode()).digest()
+    assert hmac.compare_digest(
+        stored.verifier,
+        hashlib.scrypt(presented.encode(), salt=stored.salt, n=16384, r=8, p=1, dklen=32),
+    )
+    assert credential.password not in repr(stored)
+    with pytest.raises(ValueError, match="secret has already"):
+        await first.save_credential(
+            replace(
+                record,
+                credential_id="duplicate",
+                credential=credential.model_copy(update={"credential_id": "duplicate"}),
+            )
+        )
+    for token in (
+        "a",
+        "/w==",
+        base64.b64encode(b"wrong:password-secret").decode(),
+        base64.b64encode(b"agent:wrong").decode(),
+    ):
+        assert (
+            await first.authenticate_credential(
+                "basic",
+                CredentialAuthenticationInput(
+                    headers={"authorization": (f"Basic {token}",)},
+                    method="GET",
+                    current_time=NOW,
+                    url=RESOURCE,
+                ),
+            )
+            is None
+        )
+    assert (
+        await first.authenticate_credential(
+            "basic",
+            CredentialAuthenticationInput(
+                headers={"aep-authorization": (f"Basic {presented}",)},
+                method="GET",
+                current_time=NOW,
+                url=RESOURCE,
+            ),
+        )
+        is not None
+    )
 
 
 @pytest.mark.asyncio
@@ -201,6 +335,33 @@ async def test_api_key_missing_and_invalid_presentations_have_distinct_results()
     for result in (invalid, duplicate):
         assert result.response is not None and result.response.problem is not None
         assert result.response.problem.code == "not_recognized"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("username", "password"),
+    [("agent", "pa\u00dfwort"), ("\u00e9agent", "secret"), ("agent", "s\u00e9cret")],
+)
+async def test_issued_basic_credentials_must_survive_rfc_7617_encoding(
+    username: str, password: str
+) -> None:
+    # BSC-RSP-003: RFC 7617 leaves the user-pass charset undefined without a charset parameter, so a
+    # client encoding a non-ASCII value as ISO-8859-1 and a Service storing it as UTF-8 derive
+    # different bytes from the same credential and authentication silently fails.
+    async def issue(request: GrantRequest, context: GrantContext) -> BasicGrantResponse:
+        del request, context
+        return BasicGrantResponse(
+            credential_id="basic-1",
+            expires_at=EXPIRES,
+            password=password,
+            username=username,
+        )
+
+    definition = stored_basic_grant_type(
+        StoredCredentialGrantTypeOptions(issue=issue, store=MemoryServiceCredentialStore())
+    )
+    with pytest.raises(ValueError, match="US-ASCII"):
+        await definition.handler.grant(GrantRequest(grant_type="basic"), _grant_context("basic"))
 
 
 @pytest.mark.asyncio
@@ -413,3 +574,89 @@ async def test_stored_profile_constructor_and_presentation_boundaries() -> None:
             GrantRequest(grant_type="api-key"),
             replace(_grant_context("api-key"), current_time=NOW.replace(tzinfo=None)),
         )
+
+
+@pytest.mark.asyncio
+async def test_password_hashing_runs_outside_the_event_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = hashlib.scrypt
+    threads: list[int] = []
+
+    def measured(*args: Any, **kwargs: Any) -> bytes:
+        threads.append(threading.get_ident())
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(hashlib, "scrypt", measured)
+    credential = BasicGrantResponse(
+        username="agent", password="secret", credential_id="one", expires_at=EXPIRES
+    )
+    record = ServiceCredentialRecord(
+        AGENT_DID, NOW, credential, "one", NOW + timedelta(hours=1), "basic"
+    )
+    store = MemoryServiceCredentialStore()
+    await store.save_credential(record)
+    token = base64.b64encode(b"agent:secret").decode()
+    assert (
+        await store.authenticate_credential(
+            "basic",
+            CredentialAuthenticationInput(
+                headers={"authorization": (f"Basic {token}",)},
+                method="GET",
+                current_time=NOW,
+                url=RESOURCE,
+            ),
+        )
+        is not None
+    )
+    assert len(threads) == 2 and all(identity != threading.get_ident() for identity in threads)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_duplicate_passwords_cannot_both_be_saved() -> None:
+    credential = BasicGrantResponse(
+        username="agent", password="secret", credential_id="one", expires_at=EXPIRES
+    )
+    record = ServiceCredentialRecord(
+        AGENT_DID, NOW, credential, "one", NOW + timedelta(hours=1), "basic"
+    )
+    store = MemoryServiceCredentialStore()
+    outcomes = await asyncio.gather(
+        store.save_credential(record),
+        store.save_credential(
+            replace(
+                record,
+                credential_id="two",
+                credential=credential.model_copy(update={"credential_id": "two"}),
+            )
+        ),
+        return_exceptions=True,
+    )
+    assert outcomes.count(None) == 1
+    assert sum(isinstance(value, ValueError) for value in outcomes) == 1
+    assert len(store._records) == 1
+
+
+@pytest.mark.asyncio
+async def test_direct_memory_store_preserves_utf8_basic_credentials() -> None:
+    credential = BasicGrantResponse(
+        username="\u00e9agent", password="s\u00e9cret", credential_id="utf8", expires_at=EXPIRES
+    )
+    record = ServiceCredentialRecord(
+        AGENT_DID, NOW, credential, "utf8", NOW + timedelta(hours=1), "basic"
+    )
+    store = MemoryServiceCredentialStore()
+    await store.save_credential(record)
+    token = base64.b64encode(f"{credential.username}:{credential.password}".encode()).decode()
+    assert (
+        await store.authenticate_credential(
+            "basic",
+            CredentialAuthenticationInput(
+                headers={"authorization": (f"Basic {token}",)},
+                method="GET",
+                current_time=NOW,
+                url=RESOURCE,
+            ),
+        )
+        is not None
+    )
