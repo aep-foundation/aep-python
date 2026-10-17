@@ -262,6 +262,23 @@ results for at least one hour. Replay-store `consume()` must atomically refuse a
 assertion identifier. Independent reads followed by writes do not provide these guarantees when
 requests run concurrently or the application has multiple instances.
 
+### Upgrading persisted state from 0.1.1
+
+Custom Service stores continue receiving `ServiceCredentialRecord` with a `BuiltInCredential`.
+There is no conversion to a verifier-only format in that public storage contract. Salted verifier
+changes belong to the private `MemoryServiceCredentialStore` representation, which exists only
+for the lifetime of its process. Do not delete or reissue credentials to upgrade a durable store.
+Keep identities, enrollments, revocation state, and completed command-idempotency responses too;
+deleting completed responses can repeat operations.
+
+Applications that persist `InspectCacheEntry` must serialize its `age`, `date`, and `expires`
+fields along with `cache_control`, validators, document, final URL, and `cached_at`. The additional
+fields default to empty strings, so old constructors remain callable, but they cannot recover
+freshness information that was not stored. Invalidate only old Inspect-cache entries and let the
+Agent fetch them again. Do not clear credential or command-idempotency storage with that cache.
+For mixed-version processes, use separate Inspect-cache namespaces so an older writer cannot
+discard the metadata required by an upgraded reader.
+
 ## Development
 
 Install the locked development environment and run the complete merge gate:
