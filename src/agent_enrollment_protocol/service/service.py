@@ -18,6 +18,7 @@ from agent_enrollment_protocol.core import (
     AEP_GRANT_TYPE_BASIC,
     AEP_GRANT_TYPE_OAUTH_BEARER,
     AEP_PROBLEM_MEDIA_TYPE,
+    AEP_SERVICE_DOCUMENTS_EXTENSION,
     AEP_VERSION,
     AgentStatus,
     AssertionOperation,
@@ -29,6 +30,7 @@ from agent_enrollment_protocol.core import (
     Command,
     Commands,
     CoreConfiguration,
+    EnrollmentDecisionStatus,
     EnrollRequest,
     EnrollResponse,
     Extensions,
@@ -167,6 +169,8 @@ class Service:
             document_data["claims"] = options.claims
         if options.extensions:
             document_data["extensions"] = Extensions(supported=options.extensions)
+        if options.service_documents is not None:
+            document_data["service_documents"] = options.service_documents
         if self._authentication_methods:
             document_data["authentication"] = {"methods": self._authentication_methods}
         self._document = InspectDocument.model_validate(document_data)
@@ -205,22 +209,37 @@ class Service:
             return _problem("invalid_request", "Invalid request", 400)
 
         async def execute() -> ServiceResult[EnrollResponse]:
+            effective = request
+            if self._document.extensions is None or AEP_SERVICE_DOCUMENTS_EXTENSION not in (
+                self._document.extensions.supported or ()
+            ):
+                effective = parse_json_model(
+                    json.dumps(
+                        {
+                            key: value
+                            for key, value in request.to_wire().items()
+                            if key != "acknowledged_document_ids"
+                        }
+                    ),
+                    EnrollRequest,
+                    "Enroll request",
+                )
             existing = await self._enrollment_store.find(claims.sub)
             if existing is not None:
-                return _enrollment_result(existing, claims.sub)
+                return await self._update_enrollment(effective, existing)
             required = self._document.claims.required if self._document.claims else ()
-            missing = missing_required_claim_names(required or (), request.claims)
-            if missing:
-                return _problem(
-                    "requirements_unmet",
-                    "Requirements unmet",
-                    422,
-                    requirements_pending=missing,
-                )
+            missing = missing_required_claim_names(required or (), effective.claims)
+            missing_documents = (
+                self._missing_document_ids(None)
+                if effective.acknowledged_document_ids is None
+                else ()
+            )
+            if missing or missing_documents:
+                return _document_requirements(missing, missing_documents)
 
             async def create() -> EnrollmentRecord:
                 now = self._now()
-                decision = await self._enrollment_policy.decide(request, now)
+                decision = await self._enrollment_policy.decide(effective, now)
                 _validate_enrollment_decision(decision)
                 identifier = self._identifier()
                 if not identifier:
@@ -229,19 +248,24 @@ class Service:
                     )
                 return EnrollmentRecord(
                     agent_did=claims.sub,
-                    claims=_accepted_claims(request.claims, self._document.claims),
+                    claims=_accepted_claims(effective.claims, self._document.claims),
+                    acknowledged_document_ids=(
+                        ()
+                        if decision.status is EnrollmentDecisionStatus.REJECTED
+                        else self._accepted_document_ids((), effective.acknowledged_document_ids)
+                    ),
                     created_at=now,
                     enrollment_id=identifier,
-                    owner_action_required=decision.owner_action_required,
-                    requirements_pending=tuple(decision.requirements_pending),
+                    owner_action_required=decision.owner_action_required is True,
+                    requirements_pending=tuple(decision.requirements_pending or ()),
                     since=now,
                     status=AgentStatus(decision.status.value),
                     updated_at=now,
-                    verification_pending=tuple(decision.verification_pending),
+                    verification_pending=tuple(decision.verification_pending or ()),
                 )
 
             record, _ = await self._enrollment_store.find_or_create(claims.sub, create)
-            return _enrollment_result(record, claims.sub)
+            return _enrollment_result(record, claims.sub, effective.acknowledged_document_ids)
 
         return await self._idempotent(
             claims.sub,
@@ -250,6 +274,86 @@ class Service:
             request,
             _model_parser(EnrollResponse),
             execute,
+        )
+
+    async def _update_enrollment(
+        self, request: EnrollRequest, existing: EnrollmentRecord
+    ) -> ServiceResult[EnrollResponse]:
+        _validate_enrollment_record(existing, request.agent_did)
+        now = self._now()
+        decision = await self._enrollment_policy.decide(request, now)
+        _validate_enrollment_decision(decision)
+        if decision.status is EnrollmentDecisionStatus.REJECTED:
+            return _problem("enrollment_failed", "Enrollment failed", 403)
+        if not decision.update_existing:
+            return _enrollment_result(
+                existing, request.agent_did, request.acknowledged_document_ids
+            )
+        supplied = _accepted_claims(request.claims, self._document.claims)
+        merged = dict(existing.claims.to_wire()) if existing.claims is not None else {}
+        if supplied is not None:
+            merged.update(supplied.to_wire())
+        values = parse_json_model(json.dumps(merged), ClaimValues, "enrollment claims")
+        required = self._document.claims.required if self._document.claims else ()
+        missing = missing_required_claim_names(required or (), values)
+        missing_documents = (
+            self._missing_document_ids(existing)
+            if request.acknowledged_document_ids is None
+            else ()
+        )
+        if missing or missing_documents:
+            return _document_requirements(missing, missing_documents)
+        record = await self._enrollment_store.save(
+            replace(
+                existing,
+                claims=values,
+                acknowledged_document_ids=self._accepted_document_ids(
+                    existing.acknowledged_document_ids, request.acknowledged_document_ids
+                ),
+                required_document_ids=tuple(
+                    item
+                    for item in existing.required_document_ids
+                    if item not in (request.acknowledged_document_ids or ())
+                ),
+                owner_action_required=(
+                    existing.owner_action_required
+                    if decision.owner_action_required is None
+                    else decision.owner_action_required
+                ),
+                requirements_pending=(
+                    existing.requirements_pending
+                    if decision.requirements_pending is None
+                    else tuple(decision.requirements_pending)
+                ),
+                verification_pending=(
+                    existing.verification_pending
+                    if decision.verification_pending is None
+                    else tuple(decision.verification_pending)
+                ),
+                updated_at=now,
+            )
+        )
+        return _enrollment_result(record, request.agent_did, request.acknowledged_document_ids)
+
+    def _missing_document_ids(self, record: EnrollmentRecord | None) -> tuple[str, ...]:
+        return tuple(
+            item.id
+            for item in (self._document.service_documents or ())
+            if item.enrollment == "required"
+            and (
+                record is None
+                or item.id not in record.acknowledged_document_ids
+                or item.id in record.required_document_ids
+            )
+        )
+
+    def _accepted_document_ids(
+        self, existing: tuple[str, ...], declared: tuple[str, ...] | None
+    ) -> tuple[str, ...]:
+        known = {item.id for item in (self._document.service_documents or ())}
+        return (
+            *existing,
+            *(item for item in (declared or ()) if item in known and item not in existing),
         )
 
     async def status(self, options: CommandOptions) -> ServiceResult[StatusResponse]:
@@ -290,6 +394,11 @@ class Service:
                 return _problem("unsupported_grant_type", "Unsupported grant type", 400)
             if record.status is not AgentStatus.ACTIVE:
                 return _grant_lifecycle_problem(record)
+            required = self._document.claims.required if self._document.claims else ()
+            missing = missing_required_claim_names(required or (), record.claims)
+            missing_documents = self._missing_document_ids(record)
+            if missing or missing_documents:
+                return _document_requirements(missing, missing_documents)
             raw = await definition.handler.grant(
                 request,
                 GrantContext(
@@ -623,6 +732,7 @@ def _problem(
     requirements_pending: Sequence[str] = (),
     verification_pending: Sequence[str] = (),
     owner_action_required: bool = False,
+    required_document_ids: tuple[str, ...] = (),
 ) -> ServiceResult[Any]:
     data: dict[str, Any] = {
         "type": f"urn:aep:error:{code}",
@@ -636,6 +746,8 @@ def _problem(
         data["verification_pending"] = tuple(verification_pending)
     if owner_action_required:
         data["owner_action_required"] = "true"
+    if required_document_ids:
+        data["required_document_ids"] = required_document_ids
     problem = ProblemDetails.model_validate(data)
     headers = {"WWW-Authenticate": f'AEP reason="{code}"'} if status == 401 else {}
     return ServiceResult(
@@ -646,11 +758,29 @@ def _problem(
     )
 
 
-def _enrollment_result(record: EnrollmentRecord, agent_did: str) -> ServiceResult[EnrollResponse]:
+def _document_requirements(
+    claims: tuple[str, ...], documents: tuple[str, ...]
+) -> ServiceResult[Any]:
+    return _problem(
+        "requirements_unmet",
+        "Requirements unmet",
+        422,
+        requirements_pending=(*claims, "service_documents") if documents else claims,
+        owner_action_required=bool(documents),
+        required_document_ids=documents,
+    )
+
+
+def _enrollment_result(
+    record: EnrollmentRecord, agent_did: str, declared: tuple[str, ...] | None = None
+) -> ServiceResult[EnrollResponse]:
     _validate_enrollment_record(record, agent_did)
+    data = _lifecycle_data(record)
+    if declared is not None and record.status is not AgentStatus.REJECTED:
+        data["acknowledged_document_ids"] = declared
     return ServiceResult(
         status=200,
-        body=EnrollResponse.model_validate(_lifecycle_data(record)),
+        body=EnrollResponse.model_validate(data),
     )
 
 

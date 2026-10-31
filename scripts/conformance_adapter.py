@@ -6,6 +6,7 @@ import base64
 import json
 import sys
 from collections.abc import Callable, Mapping
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from inspect import Parameter, signature
@@ -41,6 +42,7 @@ from agent_enrollment_protocol.agent.types import IdentityRequest
 from agent_enrollment_protocol.core import (
     AEP_MEDIA_TYPE,
     AEP_PROBLEM_MEDIA_TYPE,
+    AEP_SERVICE_DOCUMENTS_EXTENSION,
     AepAuthorizationError,
     AepValidationError,
     AgentStatus,
@@ -69,10 +71,12 @@ from agent_enrollment_protocol.core import (
     PlatformSignCompleted,
     PlatformSignRequest,
     PlatformVerificationRequest,
+    PortableServiceDocument,
     ProblemDetails,
     ProtectedResourceAuthorization,
     RevokeRequest,
     RevokeResponse,
+    ServiceDocument,
     SigningAlgorithm,
     StatusResponse,
     VerifyClientAssertionOptions,
@@ -2438,11 +2442,15 @@ async def exercise_service_case(identifier: str, case: JsonObject) -> bool:
         await store.save(record)
         body = json.dumps(source["request"], separators=(",", ":")).encode()
 
-        class MustNotRunPolicy:
-            async def decide(self, request: Any, current_time: datetime) -> EnrollmentDecision:
-                raise ValueError("Repeated enrollment called application policy")
+        calls = 0
 
-        enroll_result = await service(store, enrollment_policy=MustNotRunPolicy()).enroll(
+        class UnchangedPolicy:
+            async def decide(self, request: Any, current_time: datetime) -> EnrollmentDecision:
+                nonlocal calls
+                calls += 1
+                return EnrollmentDecision(update_existing=False)
+
+        enroll_result = await service(store, enrollment_policy=UnchangedPolicy()).enroll(
             body,
             command_options(
                 AssertionOperation.ENROLL,
@@ -2457,7 +2465,7 @@ async def exercise_service_case(identifier: str, case: JsonObject) -> bool:
             and enroll_result.body.status.value == expected["response"]["body"]["status"]
             and restored == record
             and expected["record_replaced"] is False
-            and expected["policy_evaluated"] is False
+            and expected["policy_evaluated"] is (calls == 1)
         )
     if identifier == "operation-substitution-rejected":
         return await service_rejects_operation_substitution(case["expected"])
@@ -2935,7 +2943,327 @@ async def exercise_service_boundaries(
     raise ValueError(f"No Service boundary mapping: {identifier}")
 
 
+def document_schema_valid(schema: str, value: JsonObject) -> bool:
+    models = {
+        "enroll-request.schema.json": EnrollRequest,
+        "enroll-response.schema.json": EnrollResponse,
+        "problem.schema.json": ProblemDetails,
+        "portable-service-document.schema.json": PortableServiceDocument,
+        "inspect-document.schema.json": InspectDocument,
+        "service-documents.schema.json": InspectDocument,
+    }
+    if schema == "service-documents.schema.json":
+        value = service().inspect_document.to_wire() | value
+    return valid(models[schema], value)
+
+
+def document_structural_cases(source: JsonObject) -> list[JsonObject]:
+    cases = []
+    for item in source["cases"]:
+        descriptor = deepcopy(source["descriptor"])
+        document = deepcopy(source["document"])
+        kind = item["kind"]
+        schema = "portable-service-document.schema.json"
+        value = document
+        if kind in {"catalog", "duplicate-ids", "duplicate-media", "title", "url"}:
+            schema = "service-documents.schema.json"
+            descriptors = [descriptor]
+            if kind == "catalog":
+                descriptors = [descriptor | {"id": f"doc-{i}"} for i in range(item["count"])]
+            elif kind == "duplicate-ids":
+                descriptors *= 2
+            elif kind == "duplicate-media":
+                descriptor["representations"] *= 2
+            elif kind == "title":
+                descriptor["title"] = "x" * item["length"]
+            elif kind == "url":
+                prefix = "https://example.com/"
+                descriptor["representations"][0]["url"] = prefix + "x" * (
+                    item["length"] - len(prefix)
+                )
+            value = {
+                "extensions": {"supported": [AEP_SERVICE_DOCUMENTS_EXTENSION]},
+                "service_documents": descriptors,
+            }
+        elif kind == "blocks":
+            document["content"] = document["content"] * item["content_count"]
+            document["summary"] = [source["document"]["content"][0]] * item["summary_count"]
+        elif kind == "sections":
+            block = document["content"][0]
+            for _ in range(item["depth"]):
+                block = {"type": "section", "title": "Section", "blocks": [block]}
+            document["content"] = [block]
+        elif kind == "text":
+            document["content"][0]["text"] = "x" * item["length"]
+        elif kind == "list":
+            document["content"] = [{"type": "bulleted_list", "items": ["x"] * item["count"]}]
+        else:
+            raise ValueError(f"Unsupported structural case: {kind}")
+        cases.append({"name": item["name"], "schema": schema, "value": value})
+    return cases
+
+
+def document_descriptors(ids: list[str]) -> tuple[ServiceDocument, ...]:
+    return tuple(
+        ServiceDocument.model_validate(
+            {
+                "id": identifier,
+                "type": "terms_of_service",
+                "title": identifier,
+                "enrollment": "required",
+                "representations": [
+                    {"media_type": "text/html", "url": f"https://example.com/{identifier}"}
+                ],
+            }
+        )
+        for identifier in ids
+    )
+
+
+async def document_grant_guidance(source: JsonObject, expected: JsonObject) -> bool:
+    store = MemoryEnrollmentStore()
+    handler = GrantHandler()
+    instance = service(
+        store,
+        claims=InspectClaims(required=tuple(source["missing_claims"])),
+        extensions=(AEP_SERVICE_DOCUMENTS_EXTENSION,),
+        service_documents=document_descriptors(source["required_document_ids"]),
+        grant_types=(GrantTypeDefinition(grant_type="api-key", handler=handler),),
+    )
+    unknown = await invoke_service(
+        instance, "grant", command_options(AssertionOperation.GRANT, "unknown", "unknown")
+    )
+    if unknown.status != expected["unrecognized"]["http_status"] or unknown.problem is None:
+        return False
+    disclosed = any(
+        getattr(unknown.problem, name) is not None
+        for name in ("requirements_pending", "required_document_ids", "owner_action_required")
+    )
+    if (
+        unknown.problem.code != expected["unrecognized"]["code"]
+        or disclosed != expected["unrecognized"]["requirements_disclosed"]
+    ):
+        return False
+    for request, outcome in zip(
+        source["enroll_requests"], expected["enroll_requests"], strict=True
+    ):
+        fields = {key: value for key, value in request.items() if key not in {"name", "agent_did"}}
+        result = await invoke_service(
+            instance,
+            "enroll",
+            command_options(AssertionOperation.ENROLL, request["name"], request["name"]),
+            **fields,
+        )
+        if result.status != outcome["http_status"]:
+            return False
+        if "code" in outcome and (result.problem is None or result.problem.code != outcome["code"]):
+            return False
+        if "acknowledged_document_ids" in outcome:
+            if (
+                result.body is None
+                or list(result.body.acknowledged_document_ids)
+                != outcome["acknowledged_document_ids"]
+            ):
+                return False
+            record = await store.find(AGENT_DID)
+            if (
+                record is None
+                or bool(record.acknowledged_document_ids) != outcome["missing_documents_accepted"]
+            ):
+                return False
+    record = await store.find(AGENT_DID)
+    if record is None:
+        return False
+    await store.save(replace(record, claims=None))
+    result = await invoke_service(
+        instance, "grant", command_options(AssertionOperation.GRANT, "requirements", "requirements")
+    )
+    return (
+        result.status == expected["grant_status"]
+        and (handler.calls > 0) == expected["credential_issued"]
+        and result.problem is not None
+        and all(
+            result.problem.to_wire().get(key) == value
+            for key, value in source["problem"].items()
+            if key != "title"
+        )
+    )
+
+
+async def document_enrollment_lifecycle(source: JsonObject, expected: JsonObject) -> bool:
+    current = [NOW]
+    store = MemoryEnrollmentStore()
+    credentials = MemoryServiceCredentialStore()
+    calls = 0
+
+    class Policy:
+        async def decide(
+            self, request: EnrollRequest, current_time: datetime
+        ) -> EnrollmentDecision:
+            nonlocal calls
+            calls += 1
+            return EnrollmentDecision()
+
+    async def issue(request: GrantRequest, context: GrantContext) -> ApiKeyGrantResponse:
+        return ApiKeyGrantResponse(
+            credential_id=source["existing"]["credential_ids"][0],
+            expires_at=(NOW + timedelta(hours=1)).isoformat(),
+            api_key="document-test-key",
+            header="X-Service-Key",
+        )
+
+    options = dict(
+        enrollment_policy=Policy(),
+        clock=lambda: current[0],
+        claims=InspectClaims(optional=tuple(source["existing"]["claims"])),
+        authentication_methods=("api-key",),
+        grant_types=(
+            stored_api_key_grant_type(
+                StoredCredentialGrantTypeOptions(issue=issue, store=credentials)
+            ),
+        ),
+    )
+    initial = service(store, **options)
+    await invoke_service(
+        initial,
+        "enroll",
+        command_options(AssertionOperation.ENROLL, "initial", "initial"),
+        claims=source["existing"]["claims"],
+    )
+    original = await store.find(AGENT_DID)
+    if original is None:
+        return False
+    original = replace(
+        original,
+        enrollment_id=source["existing"]["enrollment_id"],
+        created_at=datetime.fromisoformat(source["existing"]["created"]),
+        since=datetime.fromisoformat(source["existing"]["since"]),
+        acknowledged_document_ids=tuple(source["existing"]["acknowledged_document_ids"]),
+    )
+    await store.save(original)
+    issued = await invoke_service(
+        initial, "grant", command_options(AssertionOperation.GRANT, "issue", "issue")
+    )
+    if issued.status != 200 or [issued.body["credential_id"]] != expected["credential_ids"]:
+        return False
+    instance = service(
+        store,
+        extensions=(AEP_SERVICE_DOCUMENTS_EXTENSION,),
+        service_documents=document_descriptors(source["current_required_ids"]),
+        **options,
+    )
+    for operation, outcome in zip(source["operations"], expected["operations"], strict=True):
+        previous = await store.find(AGENT_DID)
+        if previous is None:
+            return False
+        if "mark_required" in operation:
+            await store.save(
+                replace(previous, required_document_ids=tuple(operation["mark_required"]))
+            )
+        before_calls = calls
+        fields = {
+            key: value
+            for key, value in operation.items()
+            if key in {"claims", "acknowledged_document_ids"}
+        }
+        result = await invoke_service(
+            instance,
+            "enroll",
+            command_options(AssertionOperation.ENROLL, operation["name"], operation["key"]),
+            **fields,
+        )
+        record = await store.find(AGENT_DID)
+        if record is None or result.status != outcome["http_status"]:
+            return False
+        if "code" in outcome and (result.problem is None or result.problem.code != outcome["code"]):
+            return False
+        if "acknowledged_document_ids" in outcome and (
+            result.body is None
+            or list(result.body.acknowledged_document_ids) != outcome["acknowledged_document_ids"]
+        ):
+            return False
+        if (
+            "stored_ids" in outcome
+            and list(record.acknowledged_document_ids) != outcome["stored_ids"]
+        ):
+            return False
+        if (
+            "policy_effects_repeated" in outcome
+            and (calls > before_calls) != outcome["policy_effects_repeated"]
+        ):
+            return False
+        if "mutated" in outcome and (record != previous) != outcome["mutated"]:
+            return False
+        if (
+            "requirement_satisfied" in outcome
+            and (not record.required_document_ids) != outcome["requirement_satisfied"]
+        ):
+            return False
+        if (
+            (record.enrollment_id == original.enrollment_id) != expected["identity_preserved"]
+            or (record.created_at == original.created_at) != expected["creation_preserved"]
+            or (record.since == original.since) != expected["unchanged_state_timestamp_preserved"]
+            or record.claims.to_wire() != expected["claims"]
+        ):
+            return False
+        if operation["name"] == "update":
+            grant = await invoke_service(
+                instance,
+                "grant",
+                command_options(AssertionOperation.GRANT, "after-update", "after-update"),
+            )
+            if (
+                grant.problem is None
+                or list(grant.problem.required_document_ids)
+                != expected["outstanding_ids_after_update"]
+            ):
+                return False
+    for state in source["lifecycle_states"]:
+        await store.save(replace(record, status=AgentStatus(state)))
+        result = await invoke_service(
+            instance,
+            "enroll",
+            command_options(AssertionOperation.ENROLL, state, state),
+            acknowledged_document_ids=[],
+        )
+        after = await store.find(AGENT_DID)
+        if (
+            after is None
+            or (after.status.value == state) != expected["unrelated_lifecycle_states_preserved"]
+        ):
+            return False
+    await store.save(record)
+    authentication = await instance.authenticate_protected_resource(
+        ProtectedResourceRequest(
+            method="GET",
+            url=f"{AGENT_ORIGIN}/private",
+            headers={"X-Service-Key": "document-test-key"},
+        )
+    )
+    return authentication.authenticated
+
+
+def evaluate_documents(identifier: str, case: JsonObject) -> bool:
+    source, expected = case["input"], case["expected"]
+    if identifier in {"wire-shapes", "structural-limits"}:
+        cases = (
+            source["cases"] if identifier == "wire-shapes" else document_structural_cases(source)
+        )
+        return all(
+            item["name"] == outcome["name"]
+            and document_schema_valid(item["schema"], item["value"]) == outcome["valid"]
+            for item, outcome in zip(cases, expected["cases"], strict=True)
+        )
+    if identifier == "grant-guidance":
+        return asyncio.run(document_grant_guidance(source, expected))
+    if identifier == "enrollment-lifecycle":
+        return asyncio.run(document_enrollment_lifecycle(source, expected))
+    raise ValueError(f"Unsupported Service Documents vector: {identifier}")
+
+
 def evaluate_generic(role: str, category: str, identifier: str, case: JsonObject) -> bool:
+    if category == "service-documents":
+        return evaluate_documents(identifier, case)
     source = case["input"]
     expected = case["expected"]
     if role == "service" and identifier in {

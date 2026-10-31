@@ -20,6 +20,12 @@ Corruption = tuple[str, str, str, str, Any]
 # expectation flips from passed to failed; a mapping that compares two constants, or two fields of
 # the vector to each other, stays passed and fails this test.
 CORRUPTIONS: tuple[Corruption, ...] = (
+    ("service", "service-documents", "wire-shapes", "cases", []),
+    ("service", "service-documents", "structural-limits", "cases", []),
+    ("service", "service-documents", "enrollment-lifecycle", "identity_preserved", False),
+    ("service", "service-documents", "enrollment-lifecycle", "credential_ids", ["not-issued"]),
+    ("service", "service-documents", "grant-guidance", "grant_status", 200),
+    ("service", "service-documents", "grant-guidance", "credential_issued", True),
     (
         "service",
         "protected-resource",
@@ -55,7 +61,7 @@ CORRUPTIONS: tuple[Corruption, ...] = (
         "insufficient_scope",
         "invalid_request",
     ),
-    ("service", "enroll", "repeated-existing", "policy_evaluated", True),
+    ("service", "enroll", "repeated-existing", "policy_evaluated", False),
     (
         "service",
         "claims",
@@ -216,6 +222,8 @@ def test_conformance_mappings_read_the_expectation_they_publish() -> None:
 @pytest.mark.parametrize(
     "role,category,identifier,owner,method",
     [
+        ("service", "service-documents", "enrollment-lifecycle", "Service", "enroll"),
+        ("service", "service-documents", "grant-guidance", "Service", "grant"),
         ("agent", "idempotency", "command-header", "Agent", "service"),
         (
             "agent",

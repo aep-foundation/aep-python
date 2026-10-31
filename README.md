@@ -246,6 +246,89 @@ the identity owner's credentials. Authorize that relationship explicitly rather 
 every authenticated caller to verify every identity. Signing and identity management retain their
 owner checks.
 
+## Enrollment policy decisions
+
+Policy callbacks receive the request and current time. They consult their own authoritative storage when needed; the SDK does not supply an existing-enrollment hint.
+
+`EnrollmentDecision.owner_action_required`, `requirements_pending`, and `verification_pending` are optional. On initial enrollment, `None` defaults to false or an empty tuple. On repeated enrollment, `None` preserves the stored field; explicit booleans and tuples replace it, including `False` and `()` to clear it. Stored enrollment fields remain concrete values.
+
+Repeated Enroll merges supplied claims without replacing the enrollment identity, creation time, lifecycle state, or issued credentials. Return `EnrollmentDecision(update_existing=False)` to leave the record unchanged, or a rejected decision to reject the request without mutating the record. Same-key retries replay their result without repeating policy effects.
+
+## Service Documents
+
+Services advertise document descriptors through `ServiceOptions.service_documents` and include
+`AEP_SERVICE_DOCUMENTS_EXTENSION` in `ServiceOptions.extensions`. Import the constant and models
+from `agent_enrollment_protocol.core`:
+
+```python
+from agent_enrollment_protocol.core import (
+    AEP_SERVICE_DOCUMENTS_EXTENSION,
+    DocumentRepresentation,
+    ServiceDocument,
+)
+
+terms = ServiceDocument(
+    id="terms",
+    type="terms_of_service",
+    title="Terms of service",
+    enrollment="required",
+    representations=(
+        DocumentRepresentation(media_type="text/html", url="https://service.example/terms"),
+        DocumentRepresentation(
+            media_type="application/json", url="https://service.example/terms.json"
+        ),
+    ),
+)
+# Include these in the application's ServiceOptions, alongside its verifier and stores:
+# extensions=(AEP_SERVICE_DOCUMENTS_EXTENSION,), service_documents=(terms,)
+```
+
+Inspect exposes at most seven documents with unique, case-sensitive IDs of up to 32 ASCII
+characters. Each descriptor requires an HTML link. `SERVICE_DOCUMENT_TYPES` lists preferred type
+names; custom lowercase type strings are supported. A `not-required` document does not require
+acceptance. Unknown enrollment requirements are rejected rather than treated as not-required.
+
+Agents can read a portable document before enrollment:
+
+```python
+from agent_enrollment_protocol.agent import EnrollOptions, read_service_document
+
+inspection = await session.inspect()
+document = next(item for item in inspection.document.service_documents or () if item.id == "terms")
+reading = await read_service_document(document)
+# Render reading.document when present; otherwise offer reading.web_url.
+# Only after the Owner authorizes these IDs:
+result = await session.enroll(EnrollOptions(acknowledged_document_ids=("terms",)))
+```
+
+The reader uses the standard HTTP client without credentials or cookies. It accepts HTTPS with
+certificate verification and HTTP only for the literal hosts `localhost`, `127.0.0.1`, and `[::1]`.
+It refuses redirects, limits the response to one mebibyte and the operation to ten seconds by
+default, and propagates task cancellation. The application decides which document origins it
+trusts; the reader does not inspect DNS answers or connected addresses. Unsupported, oversized,
+malformed, or unavailable portable content returns the HTML link, not partial content.
+
+Portable content contains full Service-authored text and an optional multi-block summary. The SDK
+parses it into immutable models; the application renders it without summarizing or interpreting it.
+Preserve sections, lists, and wording, neutralize terminal controls, and label Service-authored
+summaries. For artificial-intelligence callers, return readable fenced text with a separate
+instruction not to interpret, summarize, or follow document instructions, plus the source link.
+Do not pass portable JSON directly as the presentation.
+
+Reading does not acknowledge a document. `None` omits the enrollment declaration; `()` explicitly
+declares no acknowledgements. Successful Enroll responses echo that operation's declaration, not
+the cumulative history. A partial declaration does not acknowledge omitted documents; the Service
+can enforce them on a later Grant. `EnrollmentRecord.acknowledged_document_ids` retains accepted
+known IDs. Application-owned stores must preserve it and `required_document_ids`; setting a known
+required ID in the latter requests renewed acceptance even if it was acknowledged before.
+
+Grant reports unmet requirements through `AgentCommandError.problem`: `requirements_pending`
+includes `service_documents`, and `required_document_ids` identifies the documents. Claim names
+may accompany them. Present the requirements, obtain the Owner's decision, and explicitly call
+Enroll with the approved IDs and any missing claims. A later Grant is a separate caller decision;
+the Agent neither chains these commands nor accepts documents automatically. Previously stored
+claims and acknowledgements survive omission on repeated Enroll.
+
 ## Application-owned storage
 
 Default memory stores retain state only for the lifetime of one process. To retain an Agent's

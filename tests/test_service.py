@@ -219,6 +219,98 @@ async def test_requirements_idempotency_and_lifecycle() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("initial", [True, False])
+@pytest.mark.parametrize("value", [None, False, True])
+async def test_policy_metadata_omission_and_explicit_values(
+    initial: bool, value: bool | None
+) -> None:
+    store = MemoryEnrollmentStore()
+    original = replace(
+        _record(),
+        owner_action_required=True,
+        requirements_pending=("review",),
+        verification_pending=("contact.email",),
+        status=AgentStatus.SUSPENDED,
+    )
+    if not initial:
+        await store.save(original)
+    decision = EnrollmentDecision(
+        owner_action_required=value,
+        requirements_pending=None if value is None else (),
+        verification_pending=None if value is None else (),
+    )
+    service, _ = _service(
+        enrollment_store=store, enrollment_policy=StaticEnrollmentPolicy(decision)
+    )
+    result = await service.enroll(
+        b'{"agent_did":"did:web:agent.example"}',
+        _options(AssertionOperation.ENROLL, "metadata", key="metadata"),
+    )
+    assert result.status == 200
+    record = await store.find(AGENT_DID)
+    assert record is not None
+    assert record.owner_action_required is (not initial if value is None else value)
+    assert record.requirements_pending == (("review",) if not initial and value is None else ())
+    assert record.verification_pending == (
+        ("contact.email",) if not initial and value is None else ()
+    )
+    if not initial:
+        assert record.enrollment_id == original.enrollment_id
+        assert record.created_at == original.created_at
+        assert record.since == original.since
+        assert record.status is AgentStatus.SUSPENDED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "decision",
+    [
+        EnrollmentDecision(status=EnrollmentDecisionStatus.REJECTED),
+        EnrollmentDecision(update_existing=False),
+        EnrollmentDecision(
+            owner_action_required=True,
+            requirements_pending=("review",),
+            verification_pending=("email",),
+        ),
+    ],
+)
+async def test_repeated_policy_decision_and_claim_merge(decision: EnrollmentDecision) -> None:
+    store = MemoryEnrollmentStore()
+    original = replace(
+        _record(),
+        claims=ClaimValues.model_validate({"contact.email": "owner@example.com"}),
+        updated_at=NOW - timedelta(hours=1),
+    )
+    await store.save(original)
+    service, _ = _service(
+        enrollment_store=store,
+        enrollment_policy=StaticEnrollmentPolicy(decision),
+        claims=InspectClaims(required=("contact.email",), optional=("person.first_name",)),
+    )
+    result = await service.enroll(
+        b'{"agent_did":"did:web:agent.example","claims":{"person.first_name":"Owner"}}',
+        _options(AssertionOperation.ENROLL, "update", key="update"),
+    )
+    record = await store.find(AGENT_DID)
+    assert record is not None
+    if decision.status is EnrollmentDecisionStatus.REJECTED or not decision.update_existing:
+        assert result.status == (
+            403 if decision.status is EnrollmentDecisionStatus.REJECTED else 200
+        )
+        assert record == original
+    else:
+        assert result.status == 200
+        assert record.claims is not None
+        assert record.claims.to_wire() == {
+            "contact.email": "owner@example.com",
+            "person.first_name": "Owner",
+        }
+        assert record.owner_action_required is True
+        assert record.requirements_pending == ("review",)
+        assert record.verification_pending == ("email",)
+
+
+@pytest.mark.asyncio
 async def test_grant_revoke_and_authentication() -> None:
     handler = GrantHandler()
     authenticator = Authenticator()

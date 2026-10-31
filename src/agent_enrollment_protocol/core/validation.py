@@ -6,8 +6,9 @@ from typing import Any, Generic, TypeVar, cast
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 
+from .constants import MAX_SERVICE_DOCUMENT_BYTES
 from .errors import AepValidationError, ValidationIssue, validation_issues
-from .models import PlatformSignResponse
+from .models import PlatformSignResponse, PortableServiceDocument
 
 ModelT = TypeVar("ModelT", bound=BaseModel)
 ValueT = TypeVar("ValueT")
@@ -47,6 +48,21 @@ def parse_platform_sign_response(data: str | bytes) -> PlatformSignResponse:
         PlatformSignResponse,
         _parse_json_value(data, PlatformSignResponse, "Platform Sign response"),
     )
+
+
+def parse_portable_service_document(data: bytes, expected_id: str) -> PortableServiceDocument:
+    try:
+        if len(data) > MAX_SERVICE_DOCUMENT_BYTES:
+            raise ValueError("document exceeds one mebibyte")
+        text = data.decode("utf-8", errors="strict")
+        document = parse_json_model(text, PortableServiceDocument, "portable document")
+        if document.id != expected_id:
+            raise ValueError("document ID does not match its descriptor")
+        return document
+    except (ValueError, RecursionError) as error:
+        raise AepValidationError(
+            "Invalid portable document.", (ValidationIssue(path="$", message=str(error)),)
+        ) from error
 
 
 def _parse_json_value(data: str | bytes, value_type: Any, document_type: str) -> Any:

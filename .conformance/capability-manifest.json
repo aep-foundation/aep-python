@@ -16,7 +16,7 @@
       "role": "platform"
     },
     {
-      "profiles": ["core-http", "claims", "api-key", "basic", "oauth-bearer"],
+      "profiles": ["core-http", "claims", "api-key", "basic", "oauth-bearer", "service-documents"],
       "role": "service"
     }
   ],

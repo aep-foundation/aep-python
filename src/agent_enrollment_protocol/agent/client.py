@@ -15,6 +15,7 @@ from agent_enrollment_protocol.core import (
     AEP_AUTHENTICATION_METHOD_JWT,
     AEP_MEDIA_TYPE,
     AEP_PROBLEM_MEDIA_TYPE,
+    AEP_SERVICE_DOCUMENTS_EXTENSION,
     AEP_WELL_KNOWN_PATH,
     AepAssertionError,
     AepValidationError,
@@ -42,7 +43,6 @@ from agent_enrollment_protocol.core import (
     decode_jwt_unverified,
     did_web_document_url,
     media_type_essence,
-    missing_required_claim_names,
     parse_json_model,
     render_authorization,
     require_service_origin_binding,
@@ -63,7 +63,6 @@ from .types import (
     AssertionSigner,
     AuthenticationOptions,
     BuiltInCredential,
-    ClaimRequirementsError,
     CommandResult,
     CredentialRecord,
     CredentialStore,
@@ -295,14 +294,12 @@ class ServiceSession:
     async def enroll(self, options: EnrollOptions | None = None) -> CommandResult[EnrollResponse]:
         options = options or EnrollOptions()
         inspection, identity, signer = await self._command_context(Command.ENROLL)
-        required = (
-            inspection.document.claims.required
-            if inspection.document.claims and inspection.document.claims.required
-            else ()
-        )
-        missing = missing_required_claim_names(required, options.claims)
-        if missing:
-            raise ClaimRequirementsError(missing)
+        if options.acknowledged_document_ids is not None and (
+            inspection.document.extensions is None
+            or AEP_SERVICE_DOCUMENTS_EXTENSION
+            not in (inspection.document.extensions.supported or ())
+        ):
+            raise ValueError("Service does not advertise the Service Documents extension")
         key = await self._idempotency_key(inspection, Command.ENROLL.value, options.idempotency_key)
         request_data: dict[str, object] = {
             "agent_did": identity.agent_did,
@@ -310,6 +307,8 @@ class ServiceSession:
         }
         if options.claims is not None:
             request_data["claims"] = options.claims
+        if options.acknowledged_document_ids is not None:
+            request_data["acknowledged_document_ids"] = options.acknowledged_document_ids
         request = EnrollRequest.model_validate(request_data)
         result = await self._execute(
             inspection,
@@ -321,6 +320,13 @@ class ServiceSession:
             key,
             _parse_enroll_response,
         )
+        if (
+            result.body.status is not AgentStatus.REJECTED
+            and result.body.acknowledged_document_ids != options.acknowledged_document_ids
+        ):
+            raise AgentCommandError(
+                result.status, "AEP document acknowledgement does not match the request"
+            )
         self._authoritative_active_enrollment = result.body.status is AgentStatus.ACTIVE
         return result
 
