@@ -9,6 +9,23 @@ AEP_AUTHORIZATION_HEADER: Final = "AEP-Authorization"
 AEP_WELL_KNOWN_PATH: Final = "/.well-known/aep"
 DEFAULT_HTTP_ENDPOINT_BASE: Final = "/aep/"
 MAX_ASSERTION_LIFETIME_SECONDS: Final = 300
+AEP_SERVICE_DOCUMENTS_EXTENSION: Final = "urn:aep:ext:aep-foundation:service-documents#v=1.0.0"
+MAX_SERVICE_DOCUMENT_BYTES: Final = 1 << 20
+SERVICE_DOCUMENT_TYPES: Final = (
+    "acceptable_use_policy",
+    "age_or_parental_consent",
+    "ai_data_use_policy",
+    "community_guidelines",
+    "cookie_policy",
+    "data_processing_agreement",
+    "data_retention_notice",
+    "electronic_signature_consent",
+    "privacy_policy",
+    "security_policy",
+    "subscription_terms",
+    "supplemental_terms",
+    "terms_of_service",
+)
 
 AEP_COMMANDS: Final = ("inspect", "enroll", "grant", "revoke", "status")
 AEP_AUTHENTICATED_COMMANDS: Final = ("enroll", "grant", "revoke", "status")

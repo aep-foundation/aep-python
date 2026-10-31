@@ -217,9 +217,6 @@ async def test_enroll_status_wait_and_claim_requirements() -> None:
     keys = FixedKeys()
     agent, provider = configured_agent(QueueTransport(inspect_response()), commands, keys=keys)
     service = agent.service("api.example.com")
-    with pytest.raises(ClaimRequirementsError) as missing:
-        await service.enroll()
-    assert missing.value.missing == ("contact.email",)
     enrolled = await service.enroll(
         EnrollOptions(claims=ClaimValues.model_validate({"contact.email": "owner@example.com"}))
     )
@@ -229,6 +226,12 @@ async def test_enroll_status_wait_and_claim_requirements() -> None:
     assert provider.claims[0].op.value == "enroll"
     assert commands.requests[0].headers["Idempotency-Key"] == "operation-key"
     assert (await service.grant()).body.grant_type == "api-key"
+
+
+def test_claim_requirements_error_preserves_missing_claim_names() -> None:
+    error = ClaimRequirementsError(("contact.email", "person.first_name"))
+    assert error.missing == ("contact.email", "person.first_name")
+    assert "contact.email" in str(error) and "person.first_name" in str(error)
 
 
 @pytest.mark.asyncio

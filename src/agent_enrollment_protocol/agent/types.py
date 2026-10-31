@@ -148,6 +148,13 @@ class CommandResult(Generic[ResultT]):
 class EnrollOptions:
     claims: ClaimValues | None = None
     idempotency_key: str | None = None
+    acknowledged_document_ids: tuple[str, ...] | None = None
+
+    def __post_init__(self) -> None:
+        if self.acknowledged_document_ids is not None:
+            object.__setattr__(
+                self, "acknowledged_document_ids", tuple(self.acknowledged_document_ids)
+            )
 
 
 @dataclass(frozen=True, slots=True)

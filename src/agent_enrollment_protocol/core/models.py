@@ -9,6 +9,7 @@ from typing import Annotated, Any, ClassVar, Literal, Self
 from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import (
+    AfterValidator,
     BaseModel,
     BeforeValidator,
     ConfigDict,
@@ -17,7 +18,7 @@ from pydantic import (
     model_validator,
 )
 
-from .constants import AEP_SIGNING_ALGORITHMS, AEP_VERSION
+from .constants import AEP_SERVICE_DOCUMENTS_EXTENSION, AEP_SIGNING_ALGORITHMS, AEP_VERSION
 
 IDENTIFIER_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 CLAIM_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)*$")
@@ -285,6 +286,129 @@ class ServiceIdentity(AepModel):
         return self
 
 
+def _document_ids(values: tuple[str, ...]) -> tuple[str, ...]:
+    if (
+        len(values) > 7
+        or len(set(values)) != len(values)
+        or any(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,31}", value) is None for value in values)
+    ):
+        raise ValueError("expected at most seven unique document IDs of 1 to 32 ASCII characters")
+    return values
+
+
+DocumentIds = Annotated[StringTuple, AfterValidator(_document_ids)]
+
+
+DocumentTitle = Annotated[str, Field(min_length=1, max_length=256)]
+DocumentText = Annotated[str, Field(min_length=1, max_length=16384)]
+DocumentId = Annotated[str, Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,31}\z")]
+
+
+class DocumentRepresentation(AepModel):
+    media_type: str = Field(pattern=r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*\z")
+    url: str = Field(min_length=1, max_length=2048)
+
+    @model_validator(mode="after")
+    def validate_url(self) -> Self:
+        if not self.url.isascii() or any(ord(char) <= 32 or char in "\\\x7f" for char in self.url):
+            raise ValueError("document URL must be an ASCII URI without controls")
+        parsed = urlsplit(self.url)
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or (
+                parsed.scheme != "https"
+                and not (
+                    parsed.scheme == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                )
+            )
+        ):
+            raise ValueError("document URL requires HTTPS or literal-loopback HTTP")
+        return self
+
+
+class ServiceDocument(AepModel):
+    id: DocumentId
+    type: str = Field(min_length=1, max_length=64, pattern=r"^[a-z][a-z0-9_]*\z")
+    title: DocumentTitle
+    enrollment: Literal["required", "not-required"]
+    representations: Annotated[tuple[DocumentRepresentation, ...], BeforeValidator(_as_tuple)] = (
+        Field(min_length=1, max_length=8)
+    )
+
+    @model_validator(mode="after")
+    def validate_representations(self) -> Self:
+        media = [item.media_type for item in self.representations]
+        if "text/html" not in media or len(set(media)) != len(media):
+            raise ValueError("representations require HTML and distinct media types")
+        return self
+
+
+class PortableDocumentBlock(AepModel):
+    type: Literal["paragraph", "section", "bulleted_list", "numbered_list"]
+    text: DocumentText | None = None
+    title: DocumentTitle | None = None
+    blocks: Annotated[tuple[PortableDocumentBlock, ...], BeforeValidator(_as_tuple)] | None = Field(
+        default=None, min_length=1
+    )
+    items: Annotated[tuple[DocumentText, ...], BeforeValidator(_as_tuple)] | None = Field(
+        default=None, min_length=1, max_length=128
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def ignore_other_block_members(cls, value: Any) -> Any:
+        if not isinstance(value, dict):
+            return value
+        kind = value.get("type")
+        ignored = (
+            {"title", "blocks", "items"}
+            if kind == "paragraph"
+            else {"text", "items"}
+            if kind == "section"
+            else {"text", "title", "blocks"}
+            if kind in ("bulleted_list", "numbered_list")
+            else set()
+        )
+        return {key: item for key, item in value.items() if key not in ignored}
+
+    @model_validator(mode="after")
+    def validate_block(self) -> Self:
+        if self.type == "paragraph" and self.text is None:
+            raise ValueError("paragraph requires text")
+        if self.type == "section" and (self.title is None or self.blocks is None):
+            raise ValueError("section requires title and blocks")
+        if self.type in {"bulleted_list", "numbered_list"} and self.items is None:
+            raise ValueError("list requires items")
+        return self
+
+
+class PortableServiceDocument(AepModel):
+    format: Literal["aep-service-document"]
+    version: Literal["1.0"]
+    id: DocumentId
+    summary: Annotated[tuple[PortableDocumentBlock, ...], BeforeValidator(_as_tuple)] | None = (
+        Field(default=None, min_length=1)
+    )
+    content: Annotated[tuple[PortableDocumentBlock, ...], BeforeValidator(_as_tuple)] = Field(
+        min_length=1
+    )
+
+    @model_validator(mode="after")
+    def validate_bounds(self) -> Self:
+        pending = [(item, 0) for item in (*(self.summary or ()), *self.content)]
+        count = 0
+        while pending:
+            block, depth = pending.pop()
+            count += 1
+            if count > 1024 or (block.type == "section" and depth >= 8):
+                raise ValueError("portable documents allow 1024 blocks and eight nested sections")
+            if block.type == "section":
+                pending.extend((item, depth + 1) for item in (block.blocks or ()))
+        return self
+
+
 class InspectDocument(AepModel):
     aep_version: str
     authentication: Authentication | None = None
@@ -296,9 +420,18 @@ class InspectDocument(AepModel):
     http: HttpConfiguration
     identity: Identity
     service: ServiceIdentity
+    service_documents: Annotated[tuple[ServiceDocument, ...], BeforeValidator(_as_tuple)] | None = (
+        Field(default=None, min_length=1, max_length=7)
+    )
 
     @model_validator(mode="after")
     def validate_document(self) -> Self:
+        if self.service_documents is not None:
+            _document_ids(tuple(item.id for item in self.service_documents))
+            if self.extensions is None or AEP_SERVICE_DOCUMENTS_EXTENSION not in (
+                self.extensions.supported or ()
+            ):
+                raise ValueError("Service Documents extension must be advertised")
         if VERSION_PATTERN.fullmatch(self.aep_version) is None:
             raise ValueError("aep_version must use major.minor syntax")
         if self.aep_version.split(".", 1)[0] != AEP_VERSION.split(".", 1)[0]:
@@ -377,6 +510,7 @@ class EnrollRequest(AepModel):
     agent_did: str = Field(min_length=1)
     claims: ClaimValues | None = None
     idempotency_key: str | None = Field(default=None, min_length=1)
+    acknowledged_document_ids: DocumentIds | None = None
 
 
 class LifecycleResponse(AepModel):
@@ -403,7 +537,7 @@ class LifecycleResponse(AepModel):
 
 
 class EnrollResponse(LifecycleResponse):
-    pass
+    acknowledged_document_ids: DocumentIds | None = None
 
 
 class StatusResponse(LifecycleResponse):
@@ -488,9 +622,20 @@ class ProblemDetails(AepModel):
     owner_action_required: Literal["true"] | None = None
     verification_pending: StringTuple | None = None
     requirements_pending: StringTuple | None = None
+    required_document_ids: DocumentIds | None = None
 
     @model_validator(mode="after")
     def validate_problem(self) -> Self:
+        documents_pending = "service_documents" in (self.requirements_pending or ())
+        if (self.required_document_ids is not None or documents_pending) and (
+            not self.required_document_ids
+            or not documents_pending
+            or self.code != "requirements_unmet"
+            or self.status != 422
+        ):
+            raise ValueError(
+                "document requirements need IDs, service_documents and HTTP 422 requirements_unmet"
+            )
         if ERROR_CODE_PATTERN.fullmatch(self.code) is None:
             raise ValueError("code must use the registered AEP error-code syntax")
         if self.type != f"urn:aep:error:{self.code}":

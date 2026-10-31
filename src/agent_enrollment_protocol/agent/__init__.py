@@ -1,6 +1,7 @@
 """Agent-side enrollment, credential, and authentication workflows."""
 
 from .client import Agent, AgentOptions, ServiceSession
+from .documents import DocumentReadResult, read_service_document
 from .platform_provider import (
     MemoryPlatformDiscoveryCache,
     PlatformAuthenticationHeaders,
@@ -64,6 +65,7 @@ __all__ = [
     "CredentialRecord",
     "CredentialStore",
     "CredentialUnavailableError",
+    "DocumentReadResult",
     "EnrollOptions",
     "EnrollmentStateError",
     "ExistingIdentityProvider",
@@ -100,4 +102,5 @@ __all__ = [
     "ServiceSession",
     "WaitOptions",
     "fetch_protected_resource",
+    "read_service_document",
 ]

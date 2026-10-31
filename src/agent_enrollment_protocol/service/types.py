@@ -23,6 +23,7 @@ from agent_enrollment_protocol.core import (
     OpenApiReference,
     ProblemDetails,
     RevokeRequest,
+    ServiceDocument,
     SigningAlgorithm,
 )
 
@@ -93,8 +94,12 @@ class EnrollmentRecord:
     status: AgentStatus
     updated_at: datetime
     verification_pending: tuple[str, ...]
+    acknowledged_document_ids: tuple[str, ...] = ()
+    required_document_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "acknowledged_document_ids", tuple(self.acknowledged_document_ids))
+        object.__setattr__(self, "required_document_ids", tuple(self.required_document_ids))
         if not self.agent_did or not self.enrollment_id:
             raise ValueError("AEP enrollment record requires Agent and enrollment identifiers")
         if any(
@@ -116,9 +121,10 @@ class EnrollmentStore(Protocol):
 @dataclass(frozen=True, slots=True)
 class EnrollmentDecision:
     status: EnrollmentDecisionStatus = EnrollmentDecisionStatus.ACTIVE
-    owner_action_required: bool = False
-    requirements_pending: tuple[str, ...] = ()
-    verification_pending: tuple[str, ...] = ()
+    owner_action_required: bool | None = None
+    requirements_pending: tuple[str, ...] | None = None
+    verification_pending: tuple[str, ...] | None = None
+    update_existing: bool = True
 
 
 class EnrollmentPolicy(Protocol):
@@ -331,6 +337,7 @@ class ServiceOptions:
     maximum_assertion_lifetime: timedelta = timedelta(minutes=5)
     openapi: OpenApiReference | None = None
     replay_store: ReplayStore | None = None
+    service_documents: tuple[ServiceDocument, ...] | None = None
     signing_algorithms: tuple[SigningAlgorithm, ...] = (
         SigningAlgorithm.EDDSA,
         SigningAlgorithm.ES256,

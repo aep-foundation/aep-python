@@ -199,7 +199,9 @@ async def test_status_and_lifecycle_boundaries() -> None:
         b'{"agent_did":"did:web:agent.example"}',
         _options(AssertionOperation.ENROLL, "existing", key="existing"),
     )
-    assert existing.status == 200
+    assert existing.status == 422
+    assert existing.problem is not None
+    assert existing.problem.requirements_pending == ("contact.email",)
 
     with pytest.raises(ValueError, match="UTC offsets"):
         replace(_record(), since=NOW.replace(tzinfo=None))
