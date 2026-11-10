@@ -60,9 +60,22 @@ The Service module includes stored credential profiles for each built-in Grant T
 Each factory accepts application-owned credential issuance and storage implementations. The included
 memory store is intended for examples and local development.
 
+Basic credentials use UTF-8 to encode `username:password` before Base64 encoding. Usernames and
+passwords may be empty or contain non-ASCII characters; usernames cannot contain a colon, and
+neither field can contain control characters.
+
 Concrete Grant Types and extensions can define additional Grant and Revoke request members. Pass
 those members through `GrantOptions.parameters` or `RevokeOptions.parameters`; the Agent retains
 control of the standard Grant Type and Revoke selector fields.
+
+## API-key credentials
+
+For an `api-key` credential, `api_key` is the complete HTTP header value. If a Service returns
+`header: "Authorization"` and `api_key: "Bearer secret"`, the Agent sends exactly
+`Authorization: Bearer secret`. The SDK does not add or remove a prefix, split the value, or trim it.
+Internal spaces and printable ASCII punctuation are allowed; empty values, leading or trailing
+spaces, control characters, and non-ASCII characters are rejected. The selected API-key header
+is also preserved when the caller selects the dedicated AEP carrier.
 
 ## Protected HTTP requests
 

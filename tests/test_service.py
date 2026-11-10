@@ -311,6 +311,25 @@ async def test_repeated_policy_decision_and_claim_merge(decision: EnrollmentDeci
 
 
 @pytest.mark.asyncio
+async def test_custom_oauth_authenticator_can_decline_a_bearer_presentation() -> None:
+    definition = GrantTypeDefinition(
+        grant_type="oauth-bearer",
+        handler=GrantHandler(),
+        authenticator=Authenticator(),
+    )
+    service, _ = _service(authentication_methods=("oauth-bearer",), grant_types=(definition,))
+    result = await service.authenticate_protected_resource(
+        ProtectedResourceRequest(
+            headers={"Authorization": "Bearer unknown"},
+            method="GET",
+            url="https://service.example/private",
+        )
+    )
+    assert result.response is not None and result.response.problem is not None
+    assert result.response.problem.code == "not_recognized"
+
+
+@pytest.mark.asyncio
 async def test_grant_revoke_and_authentication() -> None:
     handler = GrantHandler()
     authenticator = Authenticator()

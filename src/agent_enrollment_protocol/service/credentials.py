@@ -367,16 +367,13 @@ def _validate_issued_credential_config(
 
 
 def _require_encodable_basic(credential: BuiltInCredential) -> None:
-    """BSC-RSP-003: issued Basic credentials must survive RFC 7617 encoding unchanged.
-
-    RFC 7617 leaves the user-pass charset undefined without a `charset` parameter, so a client
-    encoding a non-ASCII value as ISO-8859-1 and a Service storing it as UTF-8 derive different
-    bytes from the same credential and authentication fails.
-    """
     if not isinstance(credential, BasicGrantResponse):
         return
-    if not credential.username.isascii() or not credential.password.isascii():
-        raise ValueError("AEP issued Basic credentials must be encodable as US-ASCII")
+    try:
+        credential.username.encode()
+        credential.password.encode()
+    except UnicodeEncodeError:
+        raise ValueError("AEP issued Basic credentials must be encodable as UTF-8") from None
 
 
 def _configured_api_key_headers(config: GrantTypeConfig) -> frozenset[str] | None:

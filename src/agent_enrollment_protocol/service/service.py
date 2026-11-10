@@ -500,26 +500,24 @@ class Service:
                     authentication_method=AEP_AUTHENTICATION_METHOD_JWT,
                 ),
             )
-        if presentation is not None:
-            method = (
-                AEP_GRANT_TYPE_BASIC
-                if presentation.scheme is AuthorizationScheme.BASIC
-                else AEP_GRANT_TYPE_OAUTH_BEARER
-            )
-            if method not in self._authentication_methods:
-                return self._protected_problem("unsupported_authentication_method", resource)
         authentication_input = CredentialAuthenticationInput(
             current_time=self._now(),
             headers=headers,
             method=request.method,
             url=resource,
         )
-        presented = presentation is not None
+        presented = presentation is not None or any(
+            _names_aep_scheme(value) for value in headers.get("authorization", ())
+        )
+        advertised_presentation = False
+        matched: AuthenticatedPrincipal | None = None
         for method in self._authentication_methods:
             if method == AEP_AUTHENTICATION_METHOD_JWT:
                 continue
             authenticator = cast(CredentialAuthenticator, self._grant_types[method].authenticator)
-            presented = presented or await authenticator.has_presentation(authentication_input)
+            detected = await authenticator.has_presentation(authentication_input)
+            advertised_presentation = advertised_presentation or detected
+            presented = presented or detected
             principal = await authenticator.authenticate(authentication_input)
             if principal is None:
                 continue
@@ -532,7 +530,19 @@ class Service:
                 raise ValueError("AEP credential authenticator returned an invalid principal")
             if not await self._active(principal.agent_did):
                 return self._protected_problem("not_recognized", resource)
-            return ProtectedResourceResult(authenticated=True, principal=principal)
+            if matched is not None:
+                return self._protected_problem("not_recognized", resource)
+            matched = principal
+        if matched is not None:
+            return ProtectedResourceResult(authenticated=True, principal=matched)
+        if presentation is not None and not advertised_presentation:
+            method = (
+                AEP_GRANT_TYPE_BASIC
+                if presentation.scheme is AuthorizationScheme.BASIC
+                else AEP_GRANT_TYPE_OAUTH_BEARER
+            )
+            if method not in self._authentication_methods:
+                return self._protected_problem("unsupported_authentication_method", resource)
         return self._protected_problem(
             "not_recognized" if presented else "authentication_required", resource
         )
@@ -888,11 +898,6 @@ def _select_presentation(
         if any(_recognized(value) for value in standard):
             return None, False
         return selected, True
-    # CORE-PR-038 separates a missing credential from a malformed one. An Authorization value
-    # naming an AEP scheme is an AEP presentation even when the rest of it does not parse, so it
-    # fails closed here; values belonging to other protocols stay available to them.
-    if any(_names_aep_scheme(value) and not _recognized(value) for value in standard):
-        return None, False
     recognized = [value for value in standard if _recognized(value)]
     if len(recognized) > 1 or (recognized and len(standard) > 1):
         return None, False

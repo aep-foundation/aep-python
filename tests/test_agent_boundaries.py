@@ -574,7 +574,7 @@ async def test_credential_presentations_and_metadata_validation() -> None:
             "access_token": "token",
             "credential_id": "bearer",
             "expires_at": expires,
-            "token_type": "Bearer",
+            "token_type": "bEaReR",
         },
         "basic": {
             "credential_id": "basic",
@@ -597,6 +597,8 @@ async def test_credential_presentations_and_metadata_validation() -> None:
         _validate_credential_record(record, record.service_did, now)
         headers = _credential_headers(record, AuthorizationCarrier.DEDICATED)
         assert "AEP-Authorization" in headers
+        if grant_type == "oauth-bearer":
+            assert headers["AEP-Authorization"] == "Bearer token"
     invalid = CredentialRecord(
         "wrong",
         now + timedelta(hours=1),

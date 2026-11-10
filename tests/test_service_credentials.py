@@ -295,6 +295,94 @@ async def test_stored_credential_profiles_issue_authenticate_and_revoke() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("username,password", [("", "secret"), ("user", ""), ("", "")])
+async def test_empty_basic_values_can_be_issued_authenticated_and_revoked(
+    username: str, password: str
+) -> None:
+    async def issue(request: GrantRequest, context: GrantContext) -> BasicGrantResponse:
+        return BasicGrantResponse(
+            username=username,
+            password=password,
+            realm="",
+            credential_id="basic",
+            expires_at=EXPIRES,
+        )
+
+    service, _ = _service(
+        authentication_methods=("basic",),
+        enrollment_store=await _active_store(),
+        grant_types=(
+            stored_basic_grant_type(
+                StoredCredentialGrantTypeOptions(issue=issue, store=MemoryServiceCredentialStore())
+            ),
+        ),
+    )
+    granted = await service.grant(
+        b'{"grant_type":"basic"}', _options(AssertionOperation.GRANT, "grant", key="grant")
+    )
+    assert granted.status == 200
+    request = ProtectedResourceRequest(
+        headers={
+            "Authorization": "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+        },
+        method="GET",
+        url=RESOURCE,
+    )
+    result = await service.authenticate_protected_resource(request)
+    assert result.authenticated
+    await service.revoke(
+        b'{"grant_type":"basic","credential_id":"basic"}',
+        _options(AssertionOperation.REVOKE, "revoke", key="revoke"),
+    )
+    assert not (await service.authenticate_protected_resource(request)).authenticated
+
+
+@pytest.mark.asyncio
+async def test_api_key_and_oauth_share_a_field_without_selecting_by_prefix() -> None:
+    store = MemoryServiceCredentialStore()
+
+    async def issue_api_key(request: GrantRequest, context: GrantContext) -> ApiKeyGrantResponse:
+        return ApiKeyGrantResponse(
+            api_key="Bearer secret", credential_id="api", expires_at=EXPIRES, header="Authorization"
+        )
+
+    async def issue_oauth(request: GrantRequest, context: GrantContext) -> OAuthBearerGrantResponse:
+        return OAuthBearerGrantResponse(
+            access_token="secret", credential_id="oauth", expires_at=EXPIRES, token_type="Bearer"
+        )
+
+    service, _ = _service(
+        authentication_methods=("oauth-bearer", "api-key"),
+        enrollment_store=await _active_store(),
+        grant_types=(
+            stored_oauth_bearer_grant_type(
+                StoredCredentialGrantTypeOptions(issue=issue_oauth, store=store)
+            ),
+            stored_api_key_grant_type(
+                StoredCredentialGrantTypeOptions(issue=issue_api_key, store=store)
+            ),
+        ),
+    )
+    request = ProtectedResourceRequest(
+        headers={"Authorization": "Bearer secret"}, method="GET", url=RESOURCE
+    )
+    invalid = await service.authenticate_protected_resource(request)
+    assert invalid.response is not None and invalid.response.problem is not None
+    assert invalid.response.problem.code == "not_recognized"
+    await service.grant(
+        b'{"grant_type":"api-key"}', _options(AssertionOperation.GRANT, "api", key="api")
+    )
+    result = await service.authenticate_protected_resource(request)
+    assert result.principal is not None and result.principal.authentication_method == "api-key"
+    await service.grant(
+        b'{"grant_type":"oauth-bearer"}', _options(AssertionOperation.GRANT, "oauth", key="oauth")
+    )
+    ambiguous = await service.authenticate_protected_resource(request)
+    assert ambiguous.response is not None and ambiguous.response.problem is not None
+    assert ambiguous.response.problem.code == "not_recognized"
+
+
+@pytest.mark.asyncio
 async def test_api_key_missing_and_invalid_presentations_have_distinct_results() -> None:
     store = MemoryServiceCredentialStore()
 
@@ -340,14 +428,13 @@ async def test_api_key_missing_and_invalid_presentations_have_distinct_results()
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("username", "password"),
-    [("agent", "pa\u00dfwort"), ("\u00e9agent", "secret"), ("agent", "s\u00e9cret")],
+    [("\ud800", "secret"), ("agent", "\udfff")],
 )
-async def test_issued_basic_credentials_must_survive_rfc_7617_encoding(
+async def test_issued_basic_credentials_reject_unencodable_values_before_storage(
     username: str, password: str
 ) -> None:
-    # BSC-RSP-003: RFC 7617 leaves the user-pass charset undefined without a charset parameter, so a
-    # client encoding a non-ASCII value as ISO-8859-1 and a Service storing it as UTF-8 derive
-    # different bytes from the same credential and authentication silently fails.
+    store = MemoryServiceCredentialStore()
+
     async def issue(request: GrantRequest, context: GrantContext) -> BasicGrantResponse:
         del request, context
         return BasicGrantResponse(
@@ -357,11 +444,12 @@ async def test_issued_basic_credentials_must_survive_rfc_7617_encoding(
             username=username,
         )
 
-    definition = stored_basic_grant_type(
-        StoredCredentialGrantTypeOptions(issue=issue, store=MemoryServiceCredentialStore())
-    )
-    with pytest.raises(ValueError, match="US-ASCII"):
+    definition = stored_basic_grant_type(StoredCredentialGrantTypeOptions(issue=issue, store=store))
+    with pytest.raises(
+        ValueError, match=r"^AEP issued Basic credentials must be encodable as UTF-8$"
+    ):
         await definition.handler.grant(GrantRequest(grant_type="basic"), _grant_context("basic"))
+    assert store._records == {}
 
 
 @pytest.mark.asyncio
