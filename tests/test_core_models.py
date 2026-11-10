@@ -68,6 +68,28 @@ from agent_enrollment_protocol.core import (
 from agent_enrollment_protocol.core.models import AepModel, _is_mailbox, parse_rfc3339
 
 
+@pytest.mark.parametrize("token_type", ["Bearer", "bearer", "BEARER", "bEaReR"])
+def test_oauth_token_type_is_case_insensitive(token_type: str) -> None:
+    response = OAuthBearerGrantResponse(
+        access_token="CaseSensitiveToken",
+        credential_id="credential-1",
+        expires_at="2027-01-01T00:00:00Z",
+        token_type=token_type,
+    )
+    assert response.access_token == "CaseSensitiveToken"
+
+
+@pytest.mark.parametrize("token_type", ["Basic", " Bearer", "Bearer ", "Bearer\n", ""])
+def test_oauth_token_type_rejects_other_values(token_type: str) -> None:
+    with pytest.raises(ValidationError):
+        OAuthBearerGrantResponse(
+            access_token="CaseSensitiveToken",
+            credential_id="credential-1",
+            expires_at="2027-01-01T00:00:00Z",
+            token_type=token_type,
+        )
+
+
 @pytest.mark.parametrize("field", ["contact_email", "contact.email"])
 def test_claim_constructor_rejects_explicit_null_for_alias_and_python_name(field: str) -> None:
     with pytest.raises(ValidationError, match="omitted"):
@@ -688,7 +710,7 @@ def test_assertion_problem_credential_and_metadata_models() -> None:
         lambda: IdempotencyMetadata(idempotency_key="one", first_body_hash="SHA256:bad"),
         lambda: OpenApiAepSecurityScheme(**{"x-aep-authentication-method": "API_KEY"}),
         lambda: ApiKeyGrantResponse(
-            api_key="bad value",
+            api_key="bad\tvalue",
             credential_id="credential",
             expires_at="2026-09-02T12:00:00Z",
             header="X-API-Key",
@@ -717,6 +739,43 @@ def test_invalid_assertion_problem_credential_and_metadata_models(factory: objec
     with pytest.raises(ValidationError):
         assert callable(factory)
         factory()
+
+
+@pytest.mark.parametrize(
+    "value", ["k", "Bearer secret", "Basic dXNlcjpwYXNz", "two  spaces", 'key,";\\value']
+)
+def test_api_key_preserves_opaque_field_value(value: str) -> None:
+    credential = ApiKeyGrantResponse(
+        api_key=value,
+        credential_id="key",
+        expires_at="2027-01-01T00:00:00Z",
+        header="Authorization",
+    )
+    assert credential.api_key == value
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "",
+        " key",
+        "key ",
+        "key\n",
+        "key\r\nInjected: value",
+        "key\tvalue",
+        "key\x00",
+        "key\x7f",
+        "kéy",
+    ],
+)
+def test_api_key_rejects_unsafe_field_value(value: str) -> None:
+    with pytest.raises(ValidationError):
+        ApiKeyGrantResponse(
+            api_key=value,
+            credential_id="key",
+            expires_at="2027-01-01T00:00:00Z",
+            header="Authorization",
+        )
 
 
 def platform_identity() -> PlatformAgentIdentity:

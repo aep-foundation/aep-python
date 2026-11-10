@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncIterator
 from dataclasses import replace
@@ -33,6 +34,7 @@ from agent_enrollment_protocol.agent.types import IdentityRequest
 from agent_enrollment_protocol.core import (
     ApiKeyGrantResponse,
     AssertionOperation,
+    BasicGrantResponse,
     ClientAssertionClaims,
     GrantRequest,
     GrantTypeConfig,
@@ -53,11 +55,13 @@ from agent_enrollment_protocol.service import (
     GrantContext,
     GrantTypeDefinition,
     MemoryServiceCredentialStore,
+    ProtectedResourceRequest,
     RevokeContext,
     Service,
     ServiceOptions,
     StoredCredentialGrantTypeOptions,
     stored_api_key_grant_type,
+    stored_basic_grant_type,
 )
 
 from .test_platform import NOW, KeyStore
@@ -69,8 +73,93 @@ RESOURCE = "https://service.example/private"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "username,password",
+    [
+        ("agent", "pa\u00dfwort"),
+        ("\u00e9agent", "secret"),
+        ("agent", "s\u00e9cret"),
+        ("\u7528\u6237", "\U0001f511:secret"),
+        ("e\u0301agent", "se\u0301cret"),
+    ],
+)
+async def test_basic_utf8_credentials_round_trip_through_agent_and_service(
+    username: str, password: str
+) -> None:
+    key = Ed25519PrivateKey.generate()
+
+    async def issue(request: GrantRequest, context: GrantContext) -> BasicGrantResponse:
+        return BasicGrantResponse(
+            username=username,
+            password=password,
+            credential_id="basic",
+            expires_at=(NOW + timedelta(hours=1)).isoformat(),
+        )
+
+    service = Service(
+        ServiceOptions(
+            service_did=SERVICE_DID,
+            identity_methods=("did:web",),
+            authentication_methods=("basic",),
+            verifier=Verifier(key),
+            clock=lambda: NOW,
+            grant_types=(
+                stored_basic_grant_type(
+                    StoredCredentialGrantTypeOptions(
+                        issue=issue, store=MemoryServiceCredentialStore()
+                    )
+                ),
+            ),
+        )
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=AepAsgiApplication(service))
+    ) as client:
+        transport = HttpxTransport(client)
+        async with Agent(
+            AgentOptions(
+                identity_provider=LocalIdentityProvider(key),
+                clock=lambda: NOW,
+                command_transport=transport,
+                inspect_transport=transport,
+            )
+        ) as agent:
+            session = agent.service("https://service.example")
+            await session.enroll()
+            await session.grant(GrantOptions(grant_type="basic"))
+            headers = await session.authentication_headers(
+                AuthenticationOptions(resource=RESOURCE, credential_id="basic")
+            )
+            assert headers == {
+                "Authorization": "Basic "
+                + base64.b64encode(f"{username}:{password}".encode()).decode("ascii")
+            }
+            request = ProtectedResourceRequest(headers=headers, method="GET", url=RESOURCE)
+            assert (await service.authenticate_protected_resource(request)).authenticated
+            await session.revoke(RevokeOptions(grant_type="basic", credential_id="basic"))
+            assert not (await service.authenticate_protected_resource(request)).authenticated
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("method", ["aep-jwt", "api-key"])
-async def test_protected_resource_helper_through_real_asgi_service(method: str) -> None:
+@pytest.mark.parametrize(
+    "header,api_key",
+    [("X-Key", "secret")]
+    + [
+        ("Authorization", value)
+        for value in [
+            "Bearer secret",
+            "bearer secret",
+            "Basic secret",
+            "basic secret",
+            "Bearer two words",
+            'key,";\\value',
+        ]
+    ],
+)
+async def test_protected_resource_helper_through_real_asgi_service(
+    method: str, header: str, api_key: str
+) -> None:
     from agent_enrollment_protocol.adapters import AsgiReceive, AsgiScope, AsgiSend
 
     key = Ed25519PrivateKey.generate()
@@ -80,9 +169,9 @@ async def test_protected_resource_helper_through_real_asgi_service(method: str) 
     async def issue(request: GrantRequest, context: GrantContext) -> ApiKeyGrantResponse:
         issued[0] += 1
         return ApiKeyGrantResponse(
-            api_key="secret",
+            api_key=api_key,
             credential_id="one",
-            header="X-Key",
+            header=header,
             expires_at=(NOW + timedelta(hours=1)).isoformat(),
         )
 
@@ -148,12 +237,17 @@ async def test_protected_resource_helper_through_real_asgi_service(method: str) 
                     request=HttpRequest(method="GET", url=RESOURCE),
                     carrier="AEP-Authorization",
                     transport=transport,
-                    additional_authentication_headers={"Authorization": "Payment opaque"},
+                    additional_authentication_headers={"Authorization": "Payment opaque"}
+                    if header != "Authorization"
+                    else {},
                 )
             )
             assert result.status == 200 and result.body == b"authenticated"
             assert [path for path, _ in received] == ["/private", "/result"]
-            assert all(headers[b"authorization"] == b"Payment opaque" for _, headers in received)
+            if header != "Authorization":
+                assert all(
+                    headers[b"authorization"] == b"Payment opaque" for _, headers in received
+                )
             if method == "aep-jwt":
                 tokens = [
                     headers[b"aep-authorization"].decode().split()[1] for _, headers in received
@@ -164,7 +258,9 @@ async def test_protected_resource_helper_through_real_asgi_service(method: str) 
                 ]
                 assert tokens[0] != tokens[1] and issued[0] == 0
             else:
-                assert all(headers[b"x-key"] == b"secret" for _, headers in received)
+                assert all(
+                    headers[header.lower().encode()] == api_key.encode() for _, headers in received
+                )
                 assert issued[0] == 1
 
 

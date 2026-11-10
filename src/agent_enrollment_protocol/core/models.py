@@ -675,7 +675,13 @@ class CredentialResponse(AepModel):
 class OAuthBearerGrantResponse(CredentialResponse):
     access_token: str = Field(min_length=1, repr=False)
     token_format: Literal["opaque", "jwt"] | None = None
-    token_type: Literal["Bearer"]
+    token_type: str
+
+    @model_validator(mode="after")
+    def validate_token_type(self) -> Self:
+        if self.token_type.lower() != "bearer":
+            raise ValueError("token_type must be Bearer (case-insensitive)")
+        return self
 
 
 class ApiKeyGrantResponse(CredentialResponse):
@@ -684,9 +690,10 @@ class ApiKeyGrantResponse(CredentialResponse):
 
     @model_validator(mode="after")
     def validate_api_key(self) -> Self:
-        if any(
-            ord(character) < 0x21 or ord(character) > 0x7E or character in {'"', ",", ";", "\\"}
-            for character in self.api_key
+        if (
+            self.api_key.startswith(" ")
+            or self.api_key.endswith(" ")
+            or any(ord(character) < 0x20 or ord(character) > 0x7E for character in self.api_key)
         ):
             raise ValueError("api_key must be an unambiguous HTTP field value")
         if HTTP_FIELD_NAME_PATTERN.fullmatch(self.header) is None:
@@ -695,9 +702,9 @@ class ApiKeyGrantResponse(CredentialResponse):
 
 
 class BasicGrantResponse(CredentialResponse):
-    password: str = Field(min_length=1, repr=False)
-    realm: str | None = Field(default=None, min_length=1)
-    username: str = Field(min_length=1)
+    password: str = Field(repr=False)
+    realm: str | None = None
+    username: str
 
     @model_validator(mode="after")
     def validate_basic(self) -> Self:
